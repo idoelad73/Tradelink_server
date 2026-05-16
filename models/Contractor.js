@@ -12,6 +12,9 @@ const contractorSchema = new Schema(
     address:     { type: String, required: true },
     expertise:   [{ type: String }],
 
+    // ── Sites ─────────────────────────────────────────────────
+    sites: [{ type: Schema.Types.ObjectId, ref: 'Site' }],
+
     // ── Session tracking ─────────────────────────────────────
     isLoggedIn:  { type: Boolean, default: false },
     lastLogin:   { type: Date,    default: null  },

@@ -1,13 +1,36 @@
 import jwt from 'jsonwebtoken';
+import TradePro from '../models/TradePro.js';
+import Contractor from '../models/Contractor.js';
 
-// Verify JWT and attach user to req.user
-export function protect(req, res, next) {
-  // functional code added later
+export async function protect(req, res, next) {
+  try {
+    let token = req.cookies?.token;
+    if (!token && req.headers.authorization?.startsWith('Bearer ')) {
+      token = req.headers.authorization.split(' ')[1];
+    }
+
+    if (!token) return res.status(401).json({ message: 'Not authenticated' });
+
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    const Model   = decoded.type === 'trade' ? TradePro : Contractor;
+    const user    = await Model.findById(decoded.id);
+
+    if (!user) return res.status(401).json({ message: 'User no longer exists' });
+
+    req.user     = user;
+    req.userId   = user._id;
+    req.userType = decoded.type;
+    next();
+  } catch {
+    return res.status(401).json({ message: 'Invalid or expired token' });
+  }
 }
 
-// Restrict to specific roles e.g. protect, restrictTo('admin')
-export function restrictTo(...roles) {
+export function restrictTo(...types) {
   return (req, res, next) => {
-    // functional code added later
+    if (!types.includes(req.userType)) {
+      return res.status(403).json({ message: 'Access denied' });
+    }
+    next();
   };
 }

@@ -23,6 +23,10 @@ const tradeProSchema = new Schema(
       coordinates: { type: [Number], default: [0, 0] },
     },
 
+    // ── Availability schedule ─────────────────────────────────
+    // Array of "YYYY-MM-DD" strings the pro marked as busy
+    busyDays: [{ type: String }],
+
     // ── Session tracking ─────────────────────────────────────
     isLoggedIn:  { type: Boolean, default: false },
     lastLogin:   { type: Date,    default: null  },

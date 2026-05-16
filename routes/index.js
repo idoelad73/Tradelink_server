@@ -1,6 +1,8 @@
 import { Router } from 'express';
 
-import authRoutes from './auth.js';
+import authRoutes       from './auth.js';
+import contractorRoutes from './contractor.js';
+import tradeRoutes      from './trade.js';
 // import userRoutes from './user.routes.js';
 // import jobRoutes from './job.routes.js';
 // import tradeRoutes from './trade.routes.js';
@@ -8,7 +10,9 @@ import authRoutes from './auth.js';
 
 const router = Router();
 
-router.use('/auth',   authRoutes);
+router.use('/auth',       authRoutes);
+router.use('/contractor', contractorRoutes);
+router.use('/trade',      tradeRoutes);
 // router.use('/users',  userRoutes);
 // router.use('/jobs',   jobRoutes);
 // router.use('/trades', tradeRoutes);
