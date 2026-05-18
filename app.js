@@ -8,7 +8,17 @@ import { errorHandler } from './middleware/errorHandler.js';
 const app = express();
 
 // ── Middleware ────────────────────────────────────────────
-app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
+app.use(cors({
+  origin: (origin, callback) => {
+    // Allow any localhost origin in development, exact CLIENT_URL in production
+    if (!origin || origin.startsWith('http://localhost') || origin === process.env.CLIENT_URL) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+}));
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(cookieParser());

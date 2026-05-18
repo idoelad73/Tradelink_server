@@ -26,12 +26,19 @@ const siteSchema = new Schema(
 
     // Optional notes or description for the site
     notes: { type: String, trim: true, default: '' },
+
+    // GeoJSON point — populated by geocoding the address on create
+    location: {
+      type:        { type: String, enum: ['Point'], default: 'Point' },
+      coordinates: { type: [Number], default: [0, 0] }, // [lng, lat]
+    },
   },
   { timestamps: true }
 );
 
 // Compound index: quickly fetch all sites for a contractor sorted by newest
 siteSchema.index({ contractor: 1, createdAt: -1 });
+siteSchema.index({ location: '2dsphere' });
 
 const Site = mongoose.model('Site', siteSchema);
 export default Site;

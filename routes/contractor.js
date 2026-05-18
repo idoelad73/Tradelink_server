@@ -3,7 +3,7 @@ import multer from 'multer';
 import { protect, restrictTo } from '../middleware/auth.js';
 import {
   getMe, updateMe,
-  createSite, getSites, getSite, updateSite, deleteSite,
+  createSite, getSites, getSite, updateSite, deleteSite, findTrades,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -26,8 +26,9 @@ router.patch('/me', updateMe);
 // Sites — full CRUD
 router.post('/sites',       upload.single('photo'), createSite);
 router.get('/sites',        getSites);
-router.get('/sites/:id',    getSite);
-router.patch('/sites/:id',  upload.single('photo'), updateSite);
-router.delete('/sites/:id', deleteSite);
+router.get('/sites/:id',              getSite);
+router.get('/sites/:id/find-trades',  findTrades);
+router.patch('/sites/:id',            upload.single('photo'), updateSite);
+router.delete('/sites/:id',           deleteSite);
 
 export default router;
