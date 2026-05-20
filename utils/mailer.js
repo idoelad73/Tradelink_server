@@ -1,17 +1,22 @@
 import nodemailer from 'nodemailer';
 
-// Supported providers for MVP: Gmail, Yahoo, iCloud, AOL, Zoho
-// Post-MVP: migrate to Resend
-
-// Transporter factory — swap provider via env var MAIL_PROVIDER
 function createTransporter() {
-  // functional code added later
-  // Gmail SMTP / OAuth2 for MVP
-  // Resend SMTP prep for post-MVP
+  return nodemailer.createTransport({
+    service: 'gmail',
+    auth: {
+      user: process.env.GMAIL_USER,
+      pass: process.env.GMAIL_APP_PASSWORD,
+    },
+  });
 }
 
-// Send an email
-// @param {{ to, subject, html, text }} options
-export async function sendMail(options) {
-  // functional code added later
+// @param {{ to, subject, html }} options
+export async function sendMail({ to, subject, html }) {
+  const transporter = createTransporter();
+  await transporter.sendMail({
+    from: `"TradeLink" <${process.env.GMAIL_USER}>`,
+    to,
+    subject,
+    html,
+  });
 }

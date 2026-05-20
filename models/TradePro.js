@@ -24,8 +24,15 @@ const tradeProSchema = new Schema(
     },
 
     // ── Availability schedule ─────────────────────────────────
-    // Array of "YYYY-MM-DD" strings the pro marked as busy
+    // Personal off days — "YYYY-MM-DD" strings (vacation, sickness, etc.)
     busyDays: [{ type: String }],
+
+    // Job bookings confirmed via email approval
+    bookings: [{
+      date:        { type: String, required: true },  // "YYYY-MM-DD"
+      siteName:    { type: String, default: '' },
+      siteAddress: { type: String, default: '' },
+    }],
 
     // ── Session tracking ─────────────────────────────────────
     isLoggedIn:  { type: Boolean, default: false },

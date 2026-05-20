@@ -1,8 +1,20 @@
 import Contractor from '../models/Contractor.js';
 import Site from '../models/Site.js';
+
+// Normalises incoming tradesNeeded — accepts string array OR {name,assigned} object array
+function normalizeTrades(raw) {
+  const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
+  return arr.map((t) =>
+    typeof t === 'string'
+      ? { name: t, assigned: false }
+      : { name: t.name, assigned: t.assigned ?? false }
+  );
+}
 import TradePro from '../models/TradePro.js';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
+import { sendMail } from '../utils/mailer.js';
+import jwt from 'jsonwebtoken';
 
 // GET /api/contractor/me
 // Returns contractor profile + count of sites
@@ -51,11 +63,7 @@ export async function createSite(req, res, next) {
       photo = result.secure_url;
     }
 
-    const tradesArr = Array.isArray(tradesNeeded)
-      ? tradesNeeded
-      : typeof tradesNeeded === 'string'
-        ? JSON.parse(tradesNeeded)
-        : [];
+    const tradesArr = tradesNeeded ? normalizeTrades(tradesNeeded) : [];
 
     // Geocode address → GeoJSON coordinates (best-effort; falls back to [0,0])
     const coords = await geocodeAddress(address);
@@ -110,16 +118,12 @@ export async function updateSite(req, res, next) {
   try {
     const { name, type, address, tradesNeeded, notes, status } = req.body;
     const updates = {};
-    if (name         !== undefined) updates.name   = name;
-    if (type         !== undefined) updates.type   = type;
+    if (name         !== undefined) updates.name    = name;
+    if (type         !== undefined) updates.type    = type;
     if (address      !== undefined) updates.address = address;
-    if (notes        !== undefined) updates.notes  = notes;
-    if (status       !== undefined) updates.status = status;
-    if (tradesNeeded !== undefined) {
-      updates.tradesNeeded = Array.isArray(tradesNeeded)
-        ? tradesNeeded
-        : JSON.parse(tradesNeeded);
-    }
+    if (notes        !== undefined) updates.notes   = notes;
+    if (status       !== undefined) updates.status  = status;
+    if (tradesNeeded !== undefined) updates.tradesNeeded = normalizeTrades(tradesNeeded);
 
     if (req.file) {
       const result = await uploadPhoto(req.file.buffer, 'tradelink/sites');
@@ -148,6 +152,121 @@ export async function deleteSite(req, res, next) {
     await Contractor.findByIdAndUpdate(req.userId, { $pull: { sites: site._id } });
 
     res.json({ message: 'Site deleted' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/contractor/trade-pros/:tradeId/ask-availability
+// Sends an availability-request email to the trade professional
+export async function askAvailability(req, res, next) {
+  try {
+    const { date, siteName, siteAddress = '', lang = 'en' } = req.body;
+    if (!date) return res.status(400).json({ message: 'date is required' });
+
+    const [pro, contractor] = await Promise.all([
+      TradePro.findById(req.params.tradeId).select('fullName email professionality'),
+      Contractor.findById(req.userId).select('companyName'),
+    ]);
+    if (!pro) return res.status(404).json({ message: 'Trade professional not found' });
+
+    const locale      = lang === 'es' ? 'es-ES' : 'en-US';
+    const displayDate = new Date(date + 'T12:00:00').toLocaleDateString(locale, {
+      year: 'numeric', month: 'long', day: 'numeric',
+    });
+    const companyName = contractor?.companyName || (lang === 'es' ? 'Un contratista' : 'A contractor');
+
+    const copy = lang === 'es' ? {
+      header:   'Solicitud de Disponibilidad',
+      greeting: `Estimado/a <strong>${pro.fullName}</strong>`,
+      body:     `Nos comunicamos desde <strong>${companyName}</strong> a través de TradeLink. Estamos interesados en sus servicios de <strong>${pro.professionality}</strong> y quisiéramos saber si está disponible el:`,
+      siteLabel:'Obra',
+      follow:   'Si está disponible en esa fecha, por favor contáctenos para coordinar los detalles del trabajo. Esperamos su respuesta.',
+      regards:  'Saludos cordiales',
+      footer:   'Este mensaje fue enviado a través de la plataforma TradeLink. Por favor no responda a este correo automático.',
+    } : {
+      header:   'Availability Request',
+      greeting: `Dear <strong>${pro.fullName}</strong>`,
+      body:     `We are reaching out from <strong>${companyName}</strong> via TradeLink. We are interested in your <strong>${pro.professionality}</strong> services and would like to know if you are available on:`,
+      siteLabel:'Site',
+      follow:   'If you are available on this date, please get in touch with us so we can discuss the details of the work required. We look forward to hearing from you.',
+      regards:  'Best regards',
+      footer:   'This message was sent through the TradeLink platform. Please do not reply to this automated email.',
+    };
+
+    const subject = lang === 'es'
+      ? `Solicitud de disponibilidad para el ${displayDate} — ${companyName}`
+      : `Availability Request for ${displayDate} — ${companyName}`;
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#f8fafc;padding:32px;border-radius:16px;">
+        <div style="background:linear-gradient(135deg,#0ea5e9,#f59e0b);border-radius:12px;padding:24px;text-align:center;margin-bottom:24px;">
+          <h1 style="color:#fff;margin:0;font-size:22px;font-weight:800;letter-spacing:-0.5px;">TradeLink</h1>
+          <p style="color:rgba(255,255,255,0.85);margin:6px 0 0;font-size:13px;">${copy.header}</p>
+        </div>
+        <div style="background:#fff;border-radius:12px;padding:28px;border:1px solid #e2e8f0;">
+          <p style="color:#334155;font-size:15px;margin:0 0 16px;">${copy.greeting},</p>
+          <p style="color:#475569;font-size:14px;line-height:1.7;margin:0 0 16px;">${copy.body}</p>
+          <div style="background:#f0f9ff;border:2px solid #0ea5e9;border-radius:10px;padding:16px;text-align:center;margin:20px 0;">
+            <p style="margin:0;font-size:20px;font-weight:800;color:#0369a1;">📅 ${displayDate}</p>
+            ${siteName ? `<p style="margin:6px 0 0;font-size:13px;color:#64748b;">${copy.siteLabel}: <strong>${siteName}</strong></p>` : ''}
+          </div>
+          <p style="color:#475569;font-size:14px;line-height:1.7;margin:0 0 16px;">${copy.follow}</p>
+          <p style="color:#475569;font-size:14px;margin:0;">
+            ${copy.regards},<br/>
+            <strong>${companyName}</strong><br/>
+            <span style="color:#94a3b8;font-size:12px;">via TradeLink</span>
+          </p>
+        </div>
+        <p style="text-align:center;color:#94a3b8;font-size:11px;margin-top:20px;">${copy.footer}</p>
+      </div>
+    `;
+
+    // Signed token for the one-click approve button (valid 7 days)
+    const bookingToken = jwt.sign(
+      { tradeId: pro._id.toString(), date, siteName: siteName || '', siteAddress },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    const serverUrl  = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3000}`;
+    const approveUrl = `${serverUrl}/api/trade/approve-booking?token=${bookingToken}`;
+
+    const approveBtn = lang === 'es'
+      ? `<div style="text-align:center;margin:24px 0">
+           <a href="${approveUrl}" style="display:inline-block;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:15px;font-weight:800;padding:14px 32px;border-radius:12px;text-decoration:none;letter-spacing:-.2px">
+             ✅ Aprobado para el trabajo
+           </a>
+           <p style="color:#94a3b8;font-size:11px;margin-top:10px">Este enlace es válido por 7 días</p>
+         </div>`
+      : `<div style="text-align:center;margin:24px 0">
+           <a href="${approveUrl}" style="display:inline-block;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:15px;font-weight:800;padding:14px 32px;border-radius:12px;text-decoration:none;letter-spacing:-.2px">
+             ✅ Approved for the Job
+           </a>
+           <p style="color:#94a3b8;font-size:11px;margin-top:10px">This link is valid for 7 days</p>
+         </div>`;
+
+    const htmlWithBtn = html.replace(
+      '<p style="text-align:center;color:#94a3b8',
+      approveBtn + '<p style="text-align:center;color:#94a3b8'
+    );
+
+    await sendMail({ to: pro.email, subject, html: htmlWithBtn });
+
+    console.log(`[askAvailability] ✓ Email sent to ${pro.email} for date ${date}`);
+    res.json({ message: 'Availability request sent successfully.' });
+  } catch (err) {
+    console.error('[askAvailability] ERROR:', err.message);
+    next(err);
+  }
+}
+
+// GET /api/contractor/trade-pros/:tradeId/busy-days
+// Returns the busy-days calendar for a specific trade professional (read-only)
+export async function getTradeBusyDays(req, res, next) {
+  try {
+    const pro = await TradePro.findById(req.params.tradeId).select('fullName professionality busyDays bookings photo');
+    if (!pro) return res.status(404).json({ message: 'Trade professional not found' });
+    res.json({ pro });
   } catch (err) {
     next(err);
   }
@@ -213,6 +332,7 @@ export async function findTrades(req, res, next) {
           professionality: 1,
           photo:           1,
           busyDays:        1,
+          bookings:        1,
           distance:        1,
           location:        1,
         },

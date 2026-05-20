@@ -14,8 +14,12 @@ const siteSchema = new Schema(
     type:    { type: String, enum: ['residential', 'commercial'], required: true },
     address: { type: String, required: true, trim: true },
 
-    // Trades needed at this site — stored as name strings matching TRADE_PROFESSIONALITIES
-    tradesNeeded: [{ type: String, trim: true }],
+    // Trades needed at this site — each entry tracks name + whether a pro is assigned
+    tradesNeeded: [{
+      _id:      false,
+      name:     { type: String, required: true, trim: true },
+      assigned: { type: Boolean, default: false },
+    }],
 
     photo:  { type: String, default: null }, // Cloudinary URL
     status: {
