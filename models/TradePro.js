@@ -12,6 +12,8 @@ const tradeProSchema = new Schema(
     address:         { type: String, required: true },
     professionality: { type: String, required: true },
 
+    hourlyRate:   { type: Number, default: null }, // $/hr — optional
+
     photo:        { type: String, default: null }, // Cloudinary URL
     licenseDoc:   { type: String, default: null }, // Cloudinary URL
     insuranceDoc: { type: String, default: null }, // Cloudinary URL

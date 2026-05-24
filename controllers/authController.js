@@ -49,6 +49,7 @@ export async function registerTrade(req, res, next) {
     const {
       fullName, email, password, phone, address,
       professionality, locationConsent, latitude, longitude,
+      hourlyRate,
     } = req.body;
 
     const existing = await TradePro.findOne({ email });
@@ -72,6 +73,7 @@ export async function registerTrade(req, res, next) {
     const user = await TradePro.create({
       fullName, email, password, phone, address,
       professionality,
+      hourlyRate: hourlyRate ? parseFloat(hourlyRate) : null,
       photo, licenseDoc, insuranceDoc, cv,
       locationConsent: consent,
       // GeoJSON: [longitude, latitude] — MongoDB standard

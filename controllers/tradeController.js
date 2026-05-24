@@ -1,5 +1,6 @@
 import TradePro from '../models/TradePro.js';
 import jwt from 'jsonwebtoken';
+import { uploadPhoto } from '../utils/cloudinary.js';
 
 // GET /api/trade/me
 export async function getMe(req, res, next) {
@@ -14,12 +15,18 @@ export async function getMe(req, res, next) {
 // PATCH /api/trade/me
 export async function updateMe(req, res, next) {
   try {
-    const { fullName, phone, address, professionality } = req.body;
+    const { fullName, phone, address, professionality, hourlyRate } = req.body;
     const updates = {};
     if (fullName        !== undefined) updates.fullName        = fullName;
     if (phone           !== undefined) updates.phone           = phone;
     if (address         !== undefined) updates.address         = address;
     if (professionality !== undefined) updates.professionality = professionality;
+    if (hourlyRate      !== undefined) updates.hourlyRate      = hourlyRate ? parseFloat(hourlyRate) : null;
+
+    if (req.file) {
+      const result = await uploadPhoto(req.file.buffer, 'tradelink/profiles');
+      updates.photo = result.secure_url;
+    }
 
     const trade = await TradePro.findByIdAndUpdate(
       req.userId,
