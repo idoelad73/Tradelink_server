@@ -16,9 +16,12 @@ const siteSchema = new Schema(
 
     // Trades needed at this site — each entry tracks name + whether a pro is assigned
     tradesNeeded: [{
-      _id:      false,
-      name:     { type: String, required: true, trim: true },
-      assigned: { type: Boolean, default: false },
+      _id:        false,
+      name:       { type: String, required: true, trim: true },
+      assigned:   { type: Boolean, default: false },
+      budgetType: { type: String, enum: ['amount', 'hours'], default: null },
+      maxAmount:  { type: Number, default: null },
+      totalHours: { type: Number, default: null },
     }],
 
     photo:  { type: String, default: null }, // Cloudinary URL

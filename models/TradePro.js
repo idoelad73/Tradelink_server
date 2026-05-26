@@ -37,9 +37,10 @@ const tradeProSchema = new Schema(
     }],
 
     // ── Session tracking ─────────────────────────────────────
-    isLoggedIn:  { type: Boolean, default: false },
-    lastLogin:   { type: Date,    default: null  },
-    loginCount:  { type: Number,  default: 0     },
+    isLoggedIn:           { type: Boolean, default: false },
+    lastLogin:            { type: Date,    default: null  },
+    loginCount:           { type: Number,  default: 0     },
+    availabilityMessages: { type: Number,  default: 0     },
   },
   { timestamps: true }
 );

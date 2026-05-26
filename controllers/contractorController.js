@@ -6,11 +6,18 @@ function normalizeTrades(raw) {
   const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
   return arr.map((t) =>
     typeof t === 'string'
-      ? { name: t, assigned: false }
-      : { name: t.name, assigned: t.assigned ?? false }
+      ? { name: t, assigned: false, budgetType: null, maxAmount: null, totalHours: null }
+      : {
+          name:       t.name,
+          assigned:   t.assigned   ?? false,
+          budgetType: t.budgetType ?? null,
+          maxAmount:  t.maxAmount  ?? null,
+          totalHours: t.totalHours ?? null,
+        }
   );
 }
 import TradePro from '../models/TradePro.js';
+import Message from '../models/Message.js';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
 import { sendMail } from '../utils/mailer.js';
@@ -161,14 +168,32 @@ export async function deleteSite(req, res, next) {
 // Sends an availability-request email to the trade professional
 export async function askAvailability(req, res, next) {
   try {
-    const { date, siteName, siteAddress = '', lang = 'en' } = req.body;
+    const { date, siteName, siteAddress = '', lang = 'en', siteId } = req.body;
     if (!date) return res.status(400).json({ message: 'date is required' });
 
     const [pro, contractor] = await Promise.all([
-      TradePro.findById(req.params.tradeId).select('fullName email professionality'),
+      TradePro.findById(req.params.tradeId).select('fullName email professionality photo'),
       Contractor.findById(req.userId).select('companyName'),
     ]);
     if (!pro) return res.status(404).json({ message: 'Trade professional not found' });
+
+    // Duplicate check — same contractor + trade pro + site + date
+    if (siteId) {
+      const existing = await Message.findOne({
+        tradePro:      req.params.tradeId,
+        contractor:    req.userId,
+        site:          siteId,
+        requestedDate: date,
+      });
+      if (existing) {
+        return res.status(409).json({
+          duplicate: true,
+          proName:          pro.fullName,
+          proProfessionality: pro.professionality,
+          proPhoto:         pro.photo || null,
+        });
+      }
+    }
 
     const locale      = lang === 'es' ? 'es-ES' : 'en-US';
     const displayDate = new Date(date + 'T12:00:00').toLocaleDateString(locale, {
@@ -252,6 +277,20 @@ export async function askAvailability(req, res, next) {
 
     await sendMail({ to: pro.email, subject, html: htmlWithBtn });
 
+    // Create message record + increment counter
+    if (siteId) {
+      await Message.create({
+        tradePro:      req.params.tradeId,
+        site:          siteId,
+        contractor:    req.userId,
+        requestedDate: date,
+        status:        'pending',
+      });
+    }
+    await TradePro.findByIdAndUpdate(req.params.tradeId, {
+      $inc: { availabilityMessages: 1 },
+    });
+
     console.log(`[askAvailability] ✓ Email sent to ${pro.email} for date ${date}`);
     res.json({ message: 'Availability request sent successfully.' });
   } catch (err) {
@@ -283,7 +322,7 @@ export async function findTrades(req, res, next) {
       return res.status(404).json({ message: 'Site not found' });
     }
 
-    const { trade, distance = '25', unit = 'mi' } = req.query;
+    const { trade, distance = '25', unit = 'mi', maxRate } = req.query;
     if (!trade) return res.status(400).json({ message: 'trade query param is required' });
 
     let [lng, lat] = site.location.coordinates;
@@ -314,16 +353,45 @@ export async function findTrades(req, res, next) {
       `             Radius   : ${radiusMi} mi / ${radiusKm} km (${Math.round(meters)} m)`
     );
 
-    const results = await TradePro.aggregate([
+    // Today's date key for availability sort
+    const now = new Date();
+    const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+    const pipeline = [
       {
         $geoNear: {
           near:          { type: 'Point', coordinates: [lng, lat] },
-          distanceField: 'distance',   // metres from site
+          distanceField: 'distance',
           maxDistance:   meters,
           query:         { professionality: trade },
           spherical:     true,
         },
       },
+    ];
+
+    // Optional rate ceiling — include pros with no rate set
+    if (maxRate) {
+      pipeline.push({
+        $match: {
+          $or: [
+            { hourlyRate: { $lte: parseFloat(maxRate) } },
+            { hourlyRate: null },
+            { hourlyRate: { $exists: false } },
+          ],
+        },
+      });
+    }
+
+    // Sort: available today first, then by hourlyRate ascending
+    pipeline.push(
+      {
+        $addFields: {
+          isAvailableToday: {
+            $not: [{ $in: [todayKey, { $ifNull: ['$busyDays', []] }] }],
+          },
+        },
+      },
+      { $sort: { isAvailableToday: -1, hourlyRate: 1 } },
       {
         $project: {
           fullName:        1,
@@ -331,6 +399,7 @@ export async function findTrades(req, res, next) {
           address:         1,
           professionality: 1,
           photo:           1,
+          hourlyRate:      1,
           busyDays:        1,
           bookings:        1,
           distance:        1,
@@ -338,7 +407,9 @@ export async function findTrades(req, res, next) {
         },
       },
       { $limit: 50 },
-    ]);
+    );
+
+    const results = await TradePro.aggregate(pipeline);
 
     if (results.length === 0) {
       console.log(`[findTrades] No ${trade} professionals found within radius.`);

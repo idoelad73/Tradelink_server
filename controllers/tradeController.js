@@ -1,12 +1,16 @@
 import TradePro from '../models/TradePro.js';
+import Message from '../models/Message.js';
 import jwt from 'jsonwebtoken';
 import { uploadPhoto } from '../utils/cloudinary.js';
 
 // GET /api/trade/me
 export async function getMe(req, res, next) {
   try {
-    const trade = await TradePro.findById(req.userId);
-    res.json({ trade });
+    const [trade, messageCount] = await Promise.all([
+      TradePro.findById(req.userId),
+      Message.countDocuments({ tradePro: req.userId }),
+    ]);
+    res.json({ trade: { ...trade.toObject(), availabilityMessages: messageCount } });
   } catch (err) {
     next(err);
   }
@@ -128,6 +132,54 @@ export async function updateSchedule(req, res, next) {
       { new: true }
     );
     res.json({ busyDays: trade.busyDays });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/trade/messages
+export async function getMessages(req, res, next) {
+  try {
+    const messages = await Message.find({ tradePro: req.userId })
+      .populate('site',       'name address type photo tradesNeeded')
+      .populate('contractor', 'companyName email')
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ messages });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /api/trade/messages/:id/approve
+export async function approveMessage(req, res, next) {
+  try {
+    const msg = await Message.findOne({ _id: req.params.id, tradePro: req.userId })
+      .populate('site', 'name address');
+    if (!msg) return res.status(404).json({ message: 'Message not found' });
+    if (msg.status === 'approved') return res.json({ message: 'Already approved' });
+
+    // Mark approved
+    msg.status = 'approved';
+    await msg.save();
+
+    // Push booking into TradePro bookings (same format as email-link approval)
+    const alreadyBooked = await TradePro.findOne({
+      _id: req.userId,
+      'bookings.date':     msg.requestedDate,
+      'bookings.siteName': msg.site.name,
+    });
+    if (!alreadyBooked) {
+      await TradePro.findByIdAndUpdate(req.userId, {
+        $push: { bookings: {
+          date:        msg.requestedDate,
+          siteName:    msg.site.name,
+          siteAddress: msg.site.address,
+        }},
+      });
+    }
+
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
