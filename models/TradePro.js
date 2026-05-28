@@ -29,11 +29,13 @@ const tradeProSchema = new Schema(
     // Personal off days — "YYYY-MM-DD" strings (vacation, sickness, etc.)
     busyDays: [{ type: String }],
 
-    // Job bookings confirmed via email approval
+    // Job bookings — 'order' when applied, 'booked' after contractor approves
     bookings: [{
-      date:        { type: String, required: true },  // "YYYY-MM-DD"
+      siteId:      { type: Schema.Types.ObjectId, ref: 'Site', default: null },
       siteName:    { type: String, default: '' },
       siteAddress: { type: String, default: '' },
+      dates:       [{ type: String }],   // YYYY-MM-DD for every working day in range
+      status:      { type: String, enum: ['order', 'booked'], default: 'booked' },
     }],
 
     // ── Session tracking ─────────────────────────────────────

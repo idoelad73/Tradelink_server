@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { protect, restrictTo } from '../middleware/auth.js';
 import { photoUpload, handleUploadError } from '../middleware/upload.js';
-import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage } from '../controllers/tradeController.js';
+import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob } from '../controllers/tradeController.js';
 
 const router = Router();
 
@@ -12,6 +12,8 @@ router.get('/approve-booking', approveBooking);
 router.use(protect, restrictTo('trade'));
 
 router.get('/me',          getMe);
+router.get('/find-jobs',              findJobs);
+router.post('/jobs/:siteId/apply',    applyToJob);
 router.get('/messages',           getMessages);
 router.patch('/messages/:id/approve', approveMessage);
 router.patch('/me',        photoUpload.single('photo'), handleUploadError, updateMe);

@@ -1,5 +1,6 @@
 import Contractor from '../models/Contractor.js';
 import Site from '../models/Site.js';
+import Application from '../models/Application.js';
 
 // Normalises incoming tradesNeeded — accepts string array OR {name,assigned} object array
 function normalizeTrades(raw) {
@@ -295,6 +296,62 @@ export async function askAvailability(req, res, next) {
     res.json({ message: 'Availability request sent successfully.' });
   } catch (err) {
     console.error('[askAvailability] ERROR:', err.message);
+    next(err);
+  }
+}
+
+// GET /api/contractor/applications
+export async function getApplications(req, res, next) {
+  try {
+    const siteIds = await Site.find({ contractor: req.userId }).distinct('_id');
+    const applications = await Application.find({ site: { $in: siteIds } })
+      .populate('tradePro', 'fullName professionality photo hourlyRate')
+      .populate('site',     'name address type photo tradesNeeded')
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ applications });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /api/contractor/applications/:id/approve
+export async function approveApplication(req, res, next) {
+  try {
+    const { scheduledDate } = req.body; // YYYY-MM-DD
+
+    const app = await Application.findById(req.params.id)
+      .populate('tradePro', 'professionality')
+      .populate('site',     'name address tradesNeeded contractor');
+    if (!app) return res.status(404).json({ message: 'Application not found' });
+
+    if (String(app.site.contractor) !== String(req.userId))
+      return res.status(403).json({ message: 'Not authorized' });
+
+    if (app.status === 'accepted') return res.json({ message: 'Already approved' });
+
+    app.status = 'accepted';
+    // Use contractor-provided date if given, otherwise keep trade pro's proposed date
+    if (scheduledDate) app.scheduledDate = scheduledDate;
+    await app.save();
+
+    // Mark the matching trade as assigned in the site
+    await Site.updateOne(
+      {
+        _id: app.site._id,
+        'tradesNeeded.name': { $regex: new RegExp(`^${app.tradePro.professionality}$`, 'i') },
+      },
+      { $set: { 'tradesNeeded.$.assigned': true } }
+    );
+
+    // Upgrade the 'order' booking to 'booked' (turns calendar from orange → dark red)
+    await TradePro.updateOne(
+      { _id: app.tradePro._id, 'bookings.siteId': app.site._id, 'bookings.status': 'order' },
+      { $set: { 'bookings.$.status': 'booked' } }
+    );
+
+    res.json({ ok: true });
+  } catch (err) {
     next(err);
   }
 }

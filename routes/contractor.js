@@ -5,6 +5,7 @@ import {
   getMe, updateMe,
   createSite, getSites, getSite, updateSite, deleteSite, findTrades,
   getTradeBusyDays, askAvailability,
+  getApplications, approveApplication,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -23,6 +24,10 @@ router.use(protect, restrictTo('contractor'));
 // Profile
 router.get('/me',   getMe);
 router.patch('/me', updateMe);
+
+// Applications (trade pros applying to contractor sites)
+router.get('/applications',              getApplications);
+router.patch('/applications/:id/approve', approveApplication);
 
 // Sites — full CRUD
 router.post('/sites',       upload.single('photo'), createSite);
