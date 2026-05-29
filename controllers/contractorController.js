@@ -321,7 +321,7 @@ export async function approveApplication(req, res, next) {
     const { scheduledDate } = req.body; // YYYY-MM-DD
 
     const app = await Application.findById(req.params.id)
-      .populate('tradePro', 'professionality')
+      .populate('tradePro', 'professionality fullName email')
       .populate('site',     'name address tradesNeeded contractor');
     if (!app) return res.status(404).json({ message: 'Application not found' });
 
@@ -331,9 +331,10 @@ export async function approveApplication(req, res, next) {
     if (app.status === 'accepted') return res.json({ message: 'Already approved' });
 
     app.status = 'accepted';
-    // Use contractor-provided date if given, otherwise keep trade pro's proposed date
     if (scheduledDate) app.scheduledDate = scheduledDate;
     await app.save();
+
+    const finalDate = app.scheduledDate || scheduledDate || null;
 
     // Mark the matching trade as assigned in the site
     await Site.updateOne(
@@ -349,6 +350,72 @@ export async function approveApplication(req, res, next) {
       { _id: app.tradePro._id, 'bookings.siteId': app.site._id, 'bookings.status': 'order' },
       { $set: { 'bookings.$.status': 'booked' } }
     );
+
+    // Get contractor name for the notification
+    const contractor = await Contractor.findById(req.userId).select('companyName');
+    const companyName = contractor?.companyName || 'Your contractor';
+
+    // Create in-app approval message for the trade pro
+    await Message.create({
+      tradePro:      app.tradePro._id,
+      site:          app.site._id,
+      contractor:    req.userId,
+      requestedDate: finalDate || '',
+      status:        'approved',
+      type:          'approval',
+    });
+    await TradePro.findByIdAndUpdate(app.tradePro._id, { $inc: { availabilityMessages: 1 } });
+
+    // Send approval email to the trade pro
+    if (app.tradePro.email) {
+      const displayDate = finalDate
+        ? new Date(finalDate + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+        : null;
+
+      const subject = `🎉 Your application for "${app.site.name}" was approved — TradeLink`;
+      const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${subject}</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
+</head><body>
+<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
+  <div style="background:linear-gradient(135deg,#22c55e,#0ea5e9);padding:28px;text-align:center">
+    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
+    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">Job Application Approved</p>
+  </div>
+  <div style="padding:32px">
+    <div style="font-size:48px;text-align:center;margin-bottom:16px">🎉</div>
+    <h2 style="color:#0f172a;font-size:20px;font-weight:800;text-align:center;margin-bottom:8px">Congratulations, ${app.tradePro.fullName}!</h2>
+    <p style="color:#475569;font-size:14px;line-height:1.7;text-align:center;margin-bottom:28px">
+      <strong>${companyName}</strong> has approved your application for the project below.
+    </p>
+
+    <div style="background:#f0fdf4;border:2px solid #86efac;border-radius:14px;padding:20px;margin-bottom:24px">
+      <p style="color:#166534;font-size:16px;font-weight:800;margin-bottom:4px">🏗️ ${app.site.name}</p>
+      <p style="color:#64748b;font-size:13px;margin-bottom:${displayDate ? '12px' : '0'}">📍 ${app.site.address}</p>
+      ${displayDate ? `<div style="background:#fff;border:1.5px solid #86efac;border-radius:10px;padding:12px;text-align:center;margin-top:4px">
+        <p style="color:#166534;font-size:15px;font-weight:800">📅 ${displayDate}</p>
+      </div>` : ''}
+    </div>
+
+    <div style="background:#fefce8;border:1.5px solid #fde68a;border-radius:12px;padding:14px;margin-bottom:28px;text-align:center">
+      <p style="color:#92400e;font-size:13px;font-weight:700">✅ Approved by ${companyName}</p>
+      <p style="color:#78350f;font-size:12px;margin-top:4px">Log in to TradeLink to view the full details and confirm your schedule.</p>
+    </div>
+
+    <p style="color:#94a3b8;font-size:12px;text-align:center;line-height:1.6">
+      This notification was sent through TradeLink. Please do not reply to this automated email.
+    </p>
+  </div>
+  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
+    <p style="color:#94a3b8;font-size:11px">TradeLink · Connecting trade professionals with projects</p>
+  </div>
+</div>
+</body></html>`;
+
+      await sendMail({ to: app.tradePro.email, subject, html });
+      console.log(`[approveApplication] Approval email sent to ${app.tradePro.email}`);
+    }
 
     res.json({ ok: true });
   } catch (err) {

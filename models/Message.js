@@ -6,8 +6,9 @@ const messageSchema = new Schema(
     tradePro:      { type: Schema.Types.ObjectId, ref: 'TradePro',   required: true, index: true },
     site:          { type: Schema.Types.ObjectId, ref: 'Site',       required: true },
     contractor:    { type: Schema.Types.ObjectId, ref: 'Contractor', required: true },
-    requestedDate: { type: String, required: true }, // YYYY-MM-DD
+    requestedDate: { type: String, default: '' }, // YYYY-MM-DD
     status:        { type: String, enum: ['pending', 'approved'], default: 'pending' },
+    type:          { type: String, enum: ['availability', 'approval'], default: 'availability' },
   },
   { timestamps: true }
 );
