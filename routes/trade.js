@@ -14,7 +14,7 @@ router.use(protect, restrictTo('trade'));
 router.get('/me',          getMe);
 router.get('/find-jobs',              findJobs);
 router.post('/jobs/:siteId/apply',    applyToJob);
-router.get('/messages',           getMessages);
+router.get('/messages',               getMessages);
 router.patch('/messages/:id/approve', approveMessage);
 router.patch('/me',        photoUpload.single('photo'), handleUploadError, updateMe);
 router.patch('/schedule',  updateSchedule);

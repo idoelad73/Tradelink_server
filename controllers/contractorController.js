@@ -286,6 +286,7 @@ export async function askAvailability(req, res, next) {
         contractor:    req.userId,
         requestedDate: date,
         status:        'pending',
+        senderType:    'contractor',
       });
     }
     await TradePro.findByIdAndUpdate(req.params.tradeId, {
@@ -336,13 +337,13 @@ export async function approveApplication(req, res, next) {
 
     const finalDate = app.scheduledDate || scheduledDate || null;
 
-    // Mark the matching trade as assigned in the site
+    // Mark the matching trade as assigned + store the trade pro's ID
     await Site.updateOne(
       {
         _id: app.site._id,
         'tradesNeeded.name': { $regex: new RegExp(`^${app.tradePro.professionality}$`, 'i') },
       },
-      { $set: { 'tradesNeeded.$.assigned': true } }
+      { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': app.tradePro._id } }
     );
 
     // Upgrade the 'order' booking to 'booked' (turns calendar from orange → dark red)
@@ -363,6 +364,7 @@ export async function approveApplication(req, res, next) {
       requestedDate: finalDate || '',
       status:        'approved',
       type:          'approval',
+      senderType:    'contractor',
     });
     await TradePro.findByIdAndUpdate(app.tradePro._id, { $inc: { availabilityMessages: 1 } });
 
@@ -558,3 +560,4 @@ export async function findTrades(req, res, next) {
     next(err);
   }
 }
+

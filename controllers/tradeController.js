@@ -1,4 +1,12 @@
 import TradePro from '../models/TradePro.js';
+import Contractor from '../models/Contractor.js';
+import Message from '../models/Message.js';
+import Site from '../models/Site.js';
+import Application from '../models/Application.js';
+import jwt from 'jsonwebtoken';
+import { uploadPhoto } from '../utils/cloudinary.js';
+import { geocodeAddress } from '../utils/geocode.js';
+import { sendMail } from '../utils/mailer.js';
 
 // ── Working-day helpers (mirrors client-side logic) ───────────────────────────
 const _hCache = {};
@@ -43,15 +51,6 @@ function computeWorkingRange(startDateStr, totalHours) {
   }
   return days;
 }
-import Message from '../models/Message.js';
-import Site from '../models/Site.js';
-import Application from '../models/Application.js';
-import Contractor from '../models/Contractor.js';
-import jwt from 'jsonwebtoken';
-import { uploadPhoto } from '../utils/cloudinary.js';
-import { geocodeAddress } from '../utils/geocode.js';
-import { sendMail } from '../utils/mailer.js';
-
 // GET /api/trade/me
 export async function getMe(req, res, next) {
   try {
@@ -299,6 +298,7 @@ export async function findJobs(req, res, next) {
         $project: {
           name: 1, address: 1, type: 1, photo: 1,
           tradesNeeded: 1, distanceMeters: 1,
+          'contractorInfo._id': 1,
           'contractorInfo.companyName': 1,
         },
       },
@@ -319,6 +319,7 @@ export async function findJobs(req, res, next) {
         photo:          site.photo,
         distanceMeters: site.distanceMeters,
         tradeEntry:     trade || null,
+        contractorId:   site.contractorInfo?._id || null,
         contractorName: site.contractorInfo?.companyName || null,
       };
     });
@@ -369,6 +370,17 @@ export async function applyToJob(req, res, next) {
         $push: { bookings: { siteId: site._id, siteName: site.name, siteAddress: site.address, dates, status: 'order' } },
       });
     }
+
+    // Record application as a pending trade message
+    await Message.create({
+      tradePro:      req.userId,
+      site:          siteId,
+      contractor:    site.contractor._id,
+      requestedDate: date || '',
+      status:        'pending',
+      senderType:    'trade',
+      type:          'availability',
+    });
 
     // Email to contractor
     const locale      = lang === 'es' ? 'es-ES' : 'en-US';
@@ -450,3 +462,5 @@ export async function applyToJob(req, res, next) {
     next(err);
   }
 }
+
+

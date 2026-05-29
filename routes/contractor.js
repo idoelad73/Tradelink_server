@@ -26,7 +26,7 @@ router.get('/me',   getMe);
 router.patch('/me', updateMe);
 
 // Applications (trade pros applying to contractor sites)
-router.get('/applications',              getApplications);
+router.get('/applications',               getApplications);
 router.patch('/applications/:id/approve', approveApplication);
 
 // Sites — full CRUD
