@@ -11,7 +11,8 @@ const app = express();
 app.use(cors({
   origin: (origin, callback) => {
     // Allow any localhost origin in development, exact CLIENT_URL in production
-    if (!origin || origin.startsWith('http://localhost') || origin === process.env.CLIENT_URL) {
+    const allowed = new Set([process.env.CLIENT_URL, 'https://trade-link-client-dev.onrender.com'].filter(Boolean));
+    if (!origin || origin.startsWith('http://localhost') || allowed.has(origin)) {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
