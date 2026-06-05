@@ -7,6 +7,7 @@ import {
   getTradeBusyDays, askAvailability,
   getApplications, approveApplication,
   getNotifications, markNotificationsRead,
+  getWorkPlan,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -40,6 +41,7 @@ router.get('/sites',        getSites);
 router.get('/trade-pros/:tradeId/busy-days',         getTradeBusyDays);
 router.post('/trade-pros/:tradeId/ask-availability', askAvailability);
 router.get('/sites/:id',              getSite);
+router.get('/sites/:id/work-plan',    getWorkPlan);
 router.get('/sites/:id/find-trades',  findTrades);
 router.patch('/sites/:id',            upload.single('photo'), updateSite);
 router.delete('/sites/:id',           deleteSite);

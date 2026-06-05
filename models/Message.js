@@ -11,7 +11,6 @@ const messageSchema = new Schema(
     status:          { type: String, enum: ['pending', 'approved'], default: 'pending' },
     type:            { type: String, enum: ['availability', 'approval'], default: 'availability' },
     senderType:      { type: String, enum: ['trade', 'contractor'], required: true },
-    contractorRead:  { type: Boolean, default: false },
   },
   { timestamps: true }
 );

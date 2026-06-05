@@ -303,13 +303,12 @@ export async function askAvailability(req, res, next) {
 }
 
 // GET /api/contractor/notifications
-// Returns unread "trade pro approved availability" messages for this contractor
+// Returns approved availability messages for this contractor (status is the only truth)
 export async function getNotifications(req, res, next) {
   try {
     const notifications = await Message.find({
-      contractor:     req.userId,
-      status:         'approved',
-      contractorRead: false,
+      contractor: req.userId,
+      status:     'approved',
     })
       .populate('tradePro', 'fullName professionality photo')
       .populate('site',     'name')
@@ -321,15 +320,43 @@ export async function getNotifications(req, res, next) {
   }
 }
 
-// PATCH /api/contractor/notifications/read
-// Marks all approved notifications as read (assigned:true is now set directly on approval)
+// PATCH /api/contractor/notifications/read  (kept for API compatibility, no-op)
 export async function markNotificationsRead(req, res, next) {
+  res.json({ ok: true });
+}
+
+// GET /api/contractor/sites/:id/work-plan
+// Returns all assigned trades for a site with trade pro details
+export async function getWorkPlan(req, res, next) {
   try {
-    await Message.updateMany(
-      { contractor: req.userId, status: 'approved', contractorRead: false },
-      { contractorRead: true }
-    );
-    res.json({ ok: true });
+    const site = await Site.findOne({ _id: req.params.id, contractor: req.userId })
+      .select('name tradesNeeded')
+      .lean();
+    if (!site) return res.status(404).json({ message: 'Site not found' });
+
+    // Only include assigned trades
+    const assigned = site.tradesNeeded.filter(t => t.assigned && t.tradeProId);
+
+    // Fetch trade pro names in one query
+    const tradeProIds = assigned.map(t => t.tradeProId);
+    const pros = await (await import('../models/TradePro.js'))
+      .default.find({ _id: { $in: tradeProIds } })
+      .select('fullName professionality')
+      .lean();
+    const proMap = Object.fromEntries(pros.map(p => [String(p._id), p]));
+
+    const rows = assigned.map(t => ({
+      professionality: t.name,
+      tradeName:       proMap[String(t.tradeProId)]?.fullName ?? '—',
+      date:            t.requiredDate ?? '—',
+      budget:          t.budgetType === 'amount' && t.maxAmount
+                         ? `$${t.maxAmount}`
+                         : t.budgetType === 'hours' && t.totalHours
+                           ? `${t.totalHours}h`
+                           : '—',
+    }));
+
+    res.json({ siteName: site.name, rows });
   } catch (err) {
     next(err);
   }
@@ -344,7 +371,29 @@ export async function getApplications(req, res, next) {
       .populate('site',     'name address type photo tradesNeeded')
       .sort({ createdAt: -1 })
       .lean();
-    res.json({ applications });
+
+    // Query messages collection: find tradePro+date pairs that are already approved
+    const approvedMsgs = await Message.find({
+      contractor: req.userId,
+      status:     'approved',
+      type:       'approval',
+    }).select('tradePro requestedDate').lean();
+
+    // Build Set of "tradeProId:date" — a trade pro already confirmed for a date
+    const bookedKeys = new Set(
+      approvedMsgs
+        .filter(m => m.tradePro && m.requestedDate)
+        .map(m => `${String(m.tradePro)}:${m.requestedDate}`)
+    );
+
+    // Flag pending applications where this trade pro is already booked on that date
+    const marked = applications.map(app => {
+      if (app.status === 'accepted') return app;
+      const key = `${String(app.tradePro?._id)}:${app.scheduledDate || ''}`;
+      return bookedKeys.has(key) ? { ...app, _alreadyBooked: true } : app;
+    });
+
+    res.json({ applications: marked });
   } catch (err) {
     next(err);
   }
@@ -364,6 +413,14 @@ export async function approveApplication(req, res, next) {
       return res.status(403).json({ message: 'Not authorized' });
 
     if (app.status === 'accepted') return res.json({ message: 'Already approved' });
+
+    // Block if this trade slot is already filled by a different pro
+    const tradeSlot = app.site.tradesNeeded?.find(
+      (t) => t.name?.toLowerCase() === app.tradePro.professionality?.toLowerCase()
+    );
+    if (tradeSlot?.assigned) {
+      return res.status(409).json({ alreadyAssigned: true, message: 'Trade already assigned for this job' });
+    }
 
     app.status = 'accepted';
     if (scheduledDate) app.scheduledDate = scheduledDate;
@@ -453,7 +510,22 @@ export async function approveApplication(req, res, next) {
       console.log(`[approveApplication] Approval email sent to ${app.tradePro.email}`);
     }
 
-    res.json({ ok: true });
+    // Check messages collection: find any other pending applications from the
+    // same trade pro on the same date so the client can gray them out immediately
+    const siblingApplicationIds = finalDate
+      ? await Application.find({
+          site:    { $in: await Site.find({ contractor: req.userId }).distinct('_id') },
+          tradePro: app.tradePro._id,
+          status:   'pending',
+        }).distinct('_id')
+      : [];
+
+    res.json({
+      ok:                  true,
+      blockedTradeProId:   String(app.tradePro._id),
+      blockedDate:         finalDate || null,
+      blockedApplicationIds: siblingApplicationIds.map(String),
+    });
   } catch (err) {
     next(err);
   }
