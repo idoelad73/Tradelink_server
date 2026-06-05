@@ -8,9 +8,10 @@ const messageSchema = new Schema(
     contractor:    { type: Schema.Types.ObjectId, ref: 'Contractor', required: true },
     requestedDate: { type: String, default: '' },        // YYYY-MM-DD
     text:          { type: String, default: '' },        // message body for direct chat
-    status:        { type: String, enum: ['pending', 'approved'], default: 'pending' },
-    type:          { type: String, enum: ['availability', 'approval'], default: 'availability' },
-    senderType:    { type: String, enum: ['trade', 'contractor'], required: true },
+    status:          { type: String, enum: ['pending', 'approved'], default: 'pending' },
+    type:            { type: String, enum: ['availability', 'approval'], default: 'availability' },
+    senderType:      { type: String, enum: ['trade', 'contractor'], required: true },
+    contractorRead:  { type: Boolean, default: false },
   },
   { timestamps: true }
 );

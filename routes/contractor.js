@@ -6,6 +6,7 @@ import {
   createSite, getSites, getSite, updateSite, deleteSite, findTrades,
   getTradeBusyDays, askAvailability,
   getApplications, approveApplication,
+  getNotifications, markNotificationsRead,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -28,6 +29,10 @@ router.patch('/me', updateMe);
 // Applications (trade pros applying to contractor sites)
 router.get('/applications',               getApplications);
 router.patch('/applications/:id/approve', approveApplication);
+
+// Availability-approved notifications
+router.get('/notifications',       getNotifications);
+router.patch('/notifications/read', markNotificationsRead);
 
 // Sites — full CRUD
 router.post('/sites',       upload.single('photo'), createSite);

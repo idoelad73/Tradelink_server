@@ -7,13 +7,14 @@ function normalizeTrades(raw) {
   const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
   return arr.map((t) =>
     typeof t === 'string'
-      ? { name: t, assigned: false, budgetType: null, maxAmount: null, totalHours: null }
+      ? { name: t, assigned: false, budgetType: null, maxAmount: null, totalHours: null, requiredDate: null }
       : {
-          name:       t.name,
-          assigned:   t.assigned   ?? false,
-          budgetType: t.budgetType ?? null,
-          maxAmount:  t.maxAmount  ?? null,
-          totalHours: t.totalHours ?? null,
+          name:         t.name,
+          assigned:     t.assigned     ?? false,
+          budgetType:   t.budgetType   ?? null,
+          maxAmount:    t.maxAmount    ?? null,
+          totalHours:   t.totalHours   ?? null,
+          requiredDate: t.requiredDate ?? null,
         }
   );
 }
@@ -301,6 +302,39 @@ export async function askAvailability(req, res, next) {
   }
 }
 
+// GET /api/contractor/notifications
+// Returns unread "trade pro approved availability" messages for this contractor
+export async function getNotifications(req, res, next) {
+  try {
+    const notifications = await Message.find({
+      contractor:     req.userId,
+      status:         'approved',
+      contractorRead: false,
+    })
+      .populate('tradePro', 'fullName professionality photo')
+      .populate('site',     'name')
+      .sort({ updatedAt: -1 })
+      .lean();
+    res.json({ notifications });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /api/contractor/notifications/read
+// Marks all approved notifications as read (assigned:true is now set directly on approval)
+export async function markNotificationsRead(req, res, next) {
+  try {
+    await Message.updateMany(
+      { contractor: req.userId, status: 'approved', contractorRead: false },
+      { contractorRead: true }
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // GET /api/contractor/applications
 export async function getApplications(req, res, next) {
   try {
@@ -451,6 +485,10 @@ export async function findTrades(req, res, next) {
     const { trade, distance = '25', unit = 'mi', maxRate } = req.query;
     if (!trade) return res.status(400).json({ message: 'trade query param is required' });
 
+    // Pull the requiredDate for this trade from the site
+    const tradeEntry  = site.tradesNeeded.find((t) => t.name === trade);
+    const requiredDate = tradeEntry?.requiredDate ?? null;
+
     let [lng, lat] = site.location.coordinates;
 
     // Site was created before geocoding was added — geocode now and persist
@@ -508,16 +546,17 @@ export async function findTrades(req, res, next) {
       });
     }
 
-    // Sort: available today first, then by hourlyRate ascending
+    // Sort: available on requiredDate (or today) first, then by hourlyRate
+    const sortDateKey = requiredDate || todayKey;
     pipeline.push(
       {
         $addFields: {
-          isAvailableToday: {
-            $not: [{ $in: [todayKey, { $ifNull: ['$busyDays', []] }] }],
+          isAvailableOnDate: {
+            $not: [{ $in: [sortDateKey, { $ifNull: ['$busyDays', []] }] }],
           },
         },
       },
-      { $sort: { isAvailableToday: -1, hourlyRate: 1 } },
+      { $sort: { isAvailableOnDate: -1, hourlyRate: 1 } },
       {
         $project: {
           fullName:        1,
@@ -555,7 +594,7 @@ export async function findTrades(req, res, next) {
 
     // Strip location from response (internal use only)
     const sanitised = results.map(({ location: _loc, ...rest }) => rest);
-    res.json({ results: sanitised, total: sanitised.length });
+    res.json({ results: sanitised, total: sanitised.length, requiredDate });
   } catch (err) {
     next(err);
   }

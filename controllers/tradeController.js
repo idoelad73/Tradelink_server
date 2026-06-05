@@ -120,12 +120,30 @@ export async function approveBooking(req, res) {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     });
 
-    const alreadyBooked = pro.bookings?.some((b) => b.date === date && b.siteName === siteName);
+    const alreadyBooked = pro.bookings?.some(
+      (b) => b.dates?.includes(date) && b.siteName === siteName
+    );
     if (!alreadyBooked) {
       await TradePro.findByIdAndUpdate(tradeId, {
-        $push: { bookings: { date, siteName, siteAddress } },
+        $push: { bookings: { siteName, siteAddress, dates: [date], status: 'booked' } },
       });
       console.log(`[approveBooking] ${pro.fullName} confirmed for "${siteName}" on ${date}`);
+    }
+
+    // Mark the matching pending message as approved and set assigned:true on the site
+    const approvedMsg = await Message.findOneAndUpdate(
+      { tradePro: tradeId, requestedDate: date, status: 'pending' },
+      { status: 'approved' },
+      { new: true }
+    );
+    if (approvedMsg?.site && pro?.professionality) {
+      await Site.updateOne(
+        {
+          _id: approvedMsg.site,
+          'tradesNeeded.name': { $regex: new RegExp(`^${pro.professionality}$`, 'i') },
+        },
+        { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': tradeId } }
+      );
     }
 
     const body = `
@@ -211,20 +229,34 @@ export async function approveMessage(req, res, next) {
     msg.status = 'approved';
     await msg.save();
 
-    // Push booking into TradePro bookings (same format as email-link approval)
+    // Push booking into TradePro bookings using dates[] array format
     const alreadyBooked = await TradePro.findOne({
       _id: req.userId,
-      'bookings.date':     msg.requestedDate,
+      'bookings.dates': msg.requestedDate,
       'bookings.siteName': msg.site.name,
     });
     if (!alreadyBooked) {
       await TradePro.findByIdAndUpdate(req.userId, {
         $push: { bookings: {
-          date:        msg.requestedDate,
+          siteId:      msg.site._id,
           siteName:    msg.site.name,
           siteAddress: msg.site.address,
+          dates:       [msg.requestedDate],
+          status:      'booked',
         }},
       });
+    }
+
+    // Set assigned:true on the site's tradesNeeded entry immediately
+    const pro = await TradePro.findById(req.userId).select('professionality');
+    if (pro?.professionality && msg.site?._id) {
+      await Site.updateOne(
+        {
+          _id: msg.site._id,
+          'tradesNeeded.name': { $regex: new RegExp(`^${pro.professionality}$`, 'i') },
+        },
+        { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': req.userId } }
+      );
     }
 
     res.json({ ok: true });
