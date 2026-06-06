@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { protect, restrictTo } from '../middleware/auth.js';
 import { photoUpload, handleUploadError } from '../middleware/upload.js';
-import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob } from '../controllers/tradeController.js';
+import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking } from '../controllers/tradeController.js';
 
 const router = Router();
 
@@ -17,7 +17,9 @@ router.post('/jobs/:siteId/apply',    applyToJob);
 router.get('/messages',               getMessages);
 router.patch('/messages/:id/approve', approveMessage);
 router.patch('/me',        photoUpload.single('photo'), handleUploadError, updateMe);
-router.patch('/schedule',  updateSchedule);
-router.patch('/location',  updateLocation);
+router.patch('/schedule',   updateSchedule);
+router.patch('/location',   updateLocation);
+router.post('/reschedule',  requestReschedule);
+router.delete('/bookings',  removeBooking);
 
 export default router;

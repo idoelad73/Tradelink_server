@@ -41,15 +41,35 @@ export function uploadDocument(buffer, folder, originalName = '') {
 
   return streamUpload(buffer, {
     folder,
-    resource_type: isImage ? 'image' : 'raw',
-    use_filename: false,
-    unique_filename: true,
+    resource_type:   isImage ? 'image' : 'raw',
+    use_filename:    true,   // preserve original filename in public_id
+    unique_filename: true,   // add unique suffix to avoid collisions
   });
 }
 
 // ── Generic uploader (kept for other future uses) ─────────────────────────────
 export function uploadToCloudinary(buffer, folder, resourceType = 'auto') {
   return streamUpload(buffer, { folder, resource_type: resourceType });
+}
+
+// ── Chat file uploader ────────────────────────────────────────────────────────
+// For RAW files (PDF/Word) the public_id MUST include the file extension so the
+// Cloudinary URL ends in .docx / .pdf and browsers download with the right name.
+export function uploadChatFile(buffer, originalName = '') {
+  const ext      = path.extname(originalName).toLowerCase();
+  const isImage  = ['.jpg', '.jpeg', '.png', '.webp'].includes(ext);
+  // Sanitise filename and embed extension in the public_id (for raw files)
+  const safeName = path.basename(originalName, ext).replace(/[^a-zA-Z0-9_-]/g, '_');
+  const publicId = `tradelink/chat/${Date.now()}_${safeName}${isImage ? '' : ext}`;
+
+  return streamUpload(buffer, {
+    folder:          undefined,        // public_id already contains the folder
+    public_id:       publicId,
+    resource_type:   isImage ? 'image' : 'raw',
+    use_filename:    false,
+    unique_filename: false,
+    overwrite:       false,
+  });
 }
 
 // ── Delete by public_id ───────────────────────────────────────────────────────

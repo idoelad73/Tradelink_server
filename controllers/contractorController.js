@@ -348,6 +348,7 @@ export async function getWorkPlan(req, res, next) {
     const rows = assigned.map(t => ({
       professionality: t.name,
       tradeName:       proMap[String(t.tradeProId)]?.fullName ?? '—',
+      tradeProId:      String(t.tradeProId),
       date:            t.requiredDate ?? '—',
       budget:          t.budgetType === 'amount' && t.maxAmount
                          ? `$${t.maxAmount}`
@@ -357,6 +358,123 @@ export async function getWorkPlan(req, res, next) {
     }));
 
     res.json({ siteName: site.name, rows });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/contractor/sites/:id/work-plan/request-date
+// Checks trade pro availability for a new date, then sends an availability request (same as askAvailability)
+export async function requestWorkPlanDate(req, res, next) {
+  try {
+    const { tradeName, requiredDate, lang = 'en' } = req.body;
+    if (!tradeName || !requiredDate) return res.status(400).json({ message: 'tradeName and requiredDate are required' });
+
+    const site = await Site.findOne({ _id: req.params.id, contractor: req.userId })
+      .select('name address tradesNeeded')
+      .lean();
+    if (!site) return res.status(404).json({ message: 'Site not found' });
+
+    const tradeEntry = site.tradesNeeded?.find(t => t.name?.toLowerCase() === tradeName.toLowerCase());
+    if (!tradeEntry?.tradeProId) return res.status(400).json({ message: 'No trade pro assigned to this trade' });
+
+    const pro = await TradePro.findById(tradeEntry.tradeProId)
+      .select('fullName email professionality photo busyDays bookings')
+      .lean();
+    if (!pro) return res.status(404).json({ message: 'Trade professional not found' });
+
+    // ── Availability check ─────────────────────────────────────────────────────
+    const isBusy   = pro.busyDays?.includes(requiredDate);
+    const isBooked = pro.bookings?.some(b =>
+      b.dates?.includes(requiredDate) && (b.status === 'booked' || b.status === 'order')
+    );
+    if (isBusy || isBooked) {
+      return res.status(409).json({ notAvailable: true, tradeName: pro.fullName });
+    }
+
+    // ── Send availability request — same logic as askAvailability ──────────────
+    const contractor = await Contractor.findById(req.userId).select('companyName').lean();
+    const companyName = contractor?.companyName || 'Your contractor';
+
+    const locale      = lang === 'es' ? 'es-ES' : 'en-US';
+    const displayDate = new Date(requiredDate + 'T12:00:00').toLocaleDateString(locale, {
+      year: 'numeric', month: 'long', day: 'numeric',
+    });
+
+    const serverUrl    = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3000}`;
+    const bookingToken = jwt.sign(
+      { tradeId: String(pro._id), date: requiredDate, siteName: site.name, siteAddress: site.address },
+      process.env.JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+    const approveUrl = `${serverUrl}/api/trade/approve-booking?token=${bookingToken}`;
+
+    const subject = lang === 'es'
+      ? `Nueva fecha solicitada para ${site.name} — ${companyName}`
+      : `Schedule update request for ${site.name} — ${companyName}`;
+
+    const html = `
+      <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#f8fafc;padding:32px;border-radius:16px;">
+        <h1 style="color:#0ea5e9;font-size:22px;font-weight:800">TradeLink</h1>
+        <p style="color:#0f172a">Dear <strong>${pro.fullName}</strong>,</p>
+        <p style="color:#475569"><strong>${companyName}</strong> has requested a schedule update for <strong>${site.name}</strong>.</p>
+        <p style="color:#0f172a;font-size:18px;font-weight:700">📅 ${displayDate}</p>
+        <div style="text-align:center;margin:24px 0">
+          <a href="${approveUrl}" style="display:inline-block;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:15px;font-weight:800;padding:14px 32px;border-radius:12px;text-decoration:none">
+            ✅ Confirm New Date
+          </a>
+          <p style="color:#94a3b8;font-size:11px;margin-top:10px">This link is valid for 7 days</p>
+        </div>
+        <p style="color:#94a3b8;font-size:11px">Sent via TradeLink</p>
+      </div>`;
+
+    if (pro.email) {
+      await sendMail({ to: pro.email, subject, html });
+    }
+
+    await Message.create({
+      tradePro:      pro._id,
+      site:          site._id || req.params.id,
+      contractor:    req.userId,
+      requestedDate: requiredDate,
+      status:        'pending',
+      senderType:    'contractor',
+    });
+    await TradePro.findByIdAndUpdate(pro._id, { $inc: { availabilityMessages: 1 } });
+
+    res.json({ ok: true, tradeName: pro.fullName });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /api/contractor/sites/:id/work-plan  — update requiredDate for a trade
+export async function updateWorkPlanDate(req, res, next) {
+  try {
+    const { tradeName, requiredDate } = req.body;
+    if (!tradeName) return res.status(400).json({ message: 'tradeName required' });
+    const result = await Site.updateOne(
+      { _id: req.params.id, contractor: req.userId, 'tradesNeeded.name': tradeName },
+      { $set: { 'tradesNeeded.$.requiredDate': requiredDate ?? null } }
+    );
+    if (result.matchedCount === 0) return res.status(404).json({ message: 'Not found' });
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// DELETE /api/contractor/sites/:id/work-plan  — unassign a trade (reset assigned + tradeProId)
+export async function deleteWorkPlanTrade(req, res, next) {
+  try {
+    const { tradeName } = req.body;
+    if (!tradeName) return res.status(400).json({ message: 'tradeName required' });
+    const result = await Site.updateOne(
+      { _id: req.params.id, contractor: req.userId, 'tradesNeeded.name': tradeName },
+      { $set: { 'tradesNeeded.$.assigned': false, 'tradesNeeded.$.tradeProId': null } }
+    );
+    if (result.matchedCount === 0) return res.status(404).json({ message: 'Not found' });
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }
@@ -393,7 +511,86 @@ export async function getApplications(req, res, next) {
       return bookedKeys.has(key) ? { ...app, _alreadyBooked: true } : app;
     });
 
-    res.json({ applications: marked });
+    // Also fetch pending reschedule requests sent by trade pros (Message, senderType:'trade')
+    const rescheduleRequests = await Message.find({
+      contractor:  req.userId,
+      status:      'pending',
+      senderType:  'trade',
+      type:        'availability',
+    })
+      .populate('tradePro', 'fullName professionality photo hourlyRate')
+      .populate('site',     'name address type photo tradesNeeded')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const reschedules = rescheduleRequests.map(m => ({ ...m, _isReschedule: true }));
+
+    res.json({ applications: marked, reschedules });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /api/contractor/messages/:id/approve-reschedule
+// Contractor approves a trade pro's reschedule request → update requiredDate + swap booking date
+export async function approveReschedule(req, res, next) {
+  try {
+    const msg = await Message.findOne({
+      _id:        req.params.id,
+      contractor: req.userId,
+      status:     'pending',
+      senderType: 'trade',
+    }).populate('tradePro', 'fullName professionality');
+    if (!msg) return res.status(404).json({ message: 'Request not found' });
+
+    const newDate = msg.requestedDate;
+    const siteId  = msg.site;
+
+    // 1. Update site's requiredDate for this trade
+    await Site.updateOne(
+      { _id: siteId, 'tradesNeeded.name': { $regex: new RegExp(`^${msg.tradePro.professionality}$`, 'i') } },
+      { $set: { 'tradesNeeded.$.requiredDate': newDate } }
+    );
+
+    // 2. Swap the booking date on the trade pro:
+    //    Remove the old booking for this site, then push a fresh one with the new date
+    const pro = await TradePro.findOne({ _id: msg.tradePro._id, 'bookings.siteId': siteId })
+      .select('bookings').lean();
+    const oldBooking = pro?.bookings?.find(b => String(b.siteId) === String(siteId));
+
+    if (oldBooking) {
+      await TradePro.updateOne(
+        { _id: msg.tradePro._id },
+        { $pull: { bookings: { siteId: siteId } } }
+      );
+      await TradePro.updateOne(
+        { _id: msg.tradePro._id },
+        { $push: { bookings: {
+          siteId:      oldBooking.siteId,
+          siteName:    oldBooking.siteName,
+          siteAddress: oldBooking.siteAddress,
+          dates:       [newDate],
+          status:      'booked',
+        }}}
+      );
+    }
+
+    // 3. Mark message as approved
+    msg.status = 'approved';
+    await msg.save();
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /api/contractor/messages/:id/decline-reschedule
+// Contractor declines a trade pro's reschedule request → delete the message
+export async function declineReschedule(req, res, next) {
+  try {
+    await Message.deleteOne({ _id: req.params.id, contractor: req.userId, status: 'pending', senderType: 'trade' });
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }

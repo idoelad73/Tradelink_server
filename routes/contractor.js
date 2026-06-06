@@ -7,7 +7,8 @@ import {
   getTradeBusyDays, askAvailability,
   getApplications, approveApplication,
   getNotifications, markNotificationsRead,
-  getWorkPlan,
+  getWorkPlan, updateWorkPlanDate, deleteWorkPlanTrade, requestWorkPlanDate,
+  approveReschedule, declineReschedule,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -28,8 +29,10 @@ router.get('/me',   getMe);
 router.patch('/me', updateMe);
 
 // Applications (trade pros applying to contractor sites)
-router.get('/applications',               getApplications);
-router.patch('/applications/:id/approve', approveApplication);
+router.get('/applications',                        getApplications);
+router.patch('/applications/:id/approve',          approveApplication);
+router.patch('/messages/:id/approve-reschedule',   approveReschedule);
+router.patch('/messages/:id/decline-reschedule',   declineReschedule);
 
 // Availability-approved notifications
 router.get('/notifications',       getNotifications);
@@ -41,7 +44,10 @@ router.get('/sites',        getSites);
 router.get('/trade-pros/:tradeId/busy-days',         getTradeBusyDays);
 router.post('/trade-pros/:tradeId/ask-availability', askAvailability);
 router.get('/sites/:id',              getSite);
-router.get('/sites/:id/work-plan',    getWorkPlan);
+router.get('/sites/:id/work-plan',            getWorkPlan);
+router.post('/sites/:id/work-plan/request-date', requestWorkPlanDate);
+router.patch('/sites/:id/work-plan',          updateWorkPlanDate);
+router.delete('/sites/:id/work-plan',         deleteWorkPlanTrade);
 router.get('/sites/:id/find-trades',  findTrades);
 router.patch('/sites/:id',            upload.single('photo'), updateSite);
 router.delete('/sites/:id',           deleteSite);

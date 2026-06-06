@@ -142,7 +142,7 @@ export async function approveBooking(req, res) {
           _id: approvedMsg.site,
           'tradesNeeded.name': { $regex: new RegExp(`^${pro.professionality}$`, 'i') },
         },
-        { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': tradeId } }
+        { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': tradeId, 'tradesNeeded.$.requiredDate': date } }
       );
     }
 
@@ -255,9 +255,73 @@ export async function approveMessage(req, res, next) {
           _id: msg.site._id,
           'tradesNeeded.name': { $regex: new RegExp(`^${pro.professionality}$`, 'i') },
         },
-        { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': req.userId } }
+        { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': req.userId, 'tradesNeeded.$.requiredDate': msg.requestedDate } }
       );
     }
+
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/trade/reschedule
+// Trade pro requests a new date for an existing booking — sends pending message to contractor
+export async function requestReschedule(req, res, next) {
+  try {
+    const { siteId, newDate } = req.body;
+    if (!siteId || !newDate) return res.status(400).json({ message: 'siteId and newDate required' });
+
+    const pro = await TradePro.findById(req.userId).select('fullName professionality busyDays bookings');
+    if (!pro) return res.status(404).json({ message: 'Trade pro not found' });
+
+    // Availability check — new date must not already be busy or booked
+    const isBusy   = pro.busyDays?.includes(newDate);
+    const isBooked = pro.bookings?.some(b => b.dates?.includes(newDate));
+    if (isBusy || isBooked) {
+      return res.status(409).json({ notAvailable: true });
+    }
+
+    const site = await Site.findById(siteId).select('contractor name address');
+    if (!site) return res.status(404).json({ message: 'Site not found' });
+
+    // Create pending availability message to contractor (same pattern as applyToJob)
+    await Message.create({
+      tradePro:      req.userId,
+      site:          siteId,
+      contractor:    site.contractor,
+      requestedDate: newDate,
+      status:        'pending',
+      senderType:    'trade',
+      type:          'availability',
+    });
+
+    res.json({ ok: true, siteName: site.name });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// DELETE /api/trade/bookings
+// Trade pro removes a booking and resets the site's assignment
+export async function removeBooking(req, res, next) {
+  try {
+    const { siteId } = req.body;
+    if (!siteId) return res.status(400).json({ message: 'siteId required' });
+
+    const pro = await TradePro.findById(req.userId).select('professionality');
+    if (!pro) return res.status(404).json({ message: 'Trade pro not found' });
+
+    // Remove all bookings for this site from the trade pro
+    await TradePro.findByIdAndUpdate(req.userId, {
+      $pull: { bookings: { siteId: siteId } },
+    });
+
+    // Reset assignment on site's tradesNeeded entry
+    await Site.updateOne(
+      { _id: siteId, 'tradesNeeded.tradeProId': req.userId },
+      { $set: { 'tradesNeeded.$.assigned': false, 'tradesNeeded.$.tradeProId': null } }
+    );
 
     res.json({ ok: true });
   } catch (err) {
