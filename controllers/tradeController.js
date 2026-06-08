@@ -2,7 +2,6 @@ import TradePro from '../models/TradePro.js';
 import Contractor from '../models/Contractor.js';
 import Message from '../models/Message.js';
 import Site from '../models/Site.js';
-import Application from '../models/Application.js';
 import jwt from 'jsonwebtoken';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
@@ -56,7 +55,7 @@ export async function getMe(req, res, next) {
   try {
     const [trade, messageCount] = await Promise.all([
       TradePro.findById(req.userId),
-      Message.countDocuments({ tradePro: req.userId }),
+      Message.countDocuments({ tradePro: req.userId, type: { $in: ['availability', 'approval'] } }),
     ]);
     res.json({ trade: { ...trade.toObject(), availabilityMessages: messageCount } });
   } catch (err) {
@@ -120,15 +119,15 @@ export async function approveBooking(req, res) {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     });
 
-    const alreadyBooked = pro.bookings?.some(
-      (b) => b.dates?.includes(date) && b.siteName === siteName
-    );
-    if (!alreadyBooked) {
-      await TradePro.findByIdAndUpdate(tradeId, {
-        $push: { bookings: { siteName, siteAddress, dates: [date], status: 'booked' } },
-      });
-      console.log(`[approveBooking] ${pro.fullName} confirmed for "${siteName}" on ${date}`);
-    }
+    // Pull any existing 'order' entry for same site, then push confirmed 'booked'
+    // so the trade calendar always shows RED (not amber) after approval.
+    await TradePro.findByIdAndUpdate(tradeId, {
+      $pull: { bookings: { siteName } },
+    });
+    await TradePro.findByIdAndUpdate(tradeId, {
+      $push: { bookings: { siteName, siteAddress, dates: [date], status: 'booked' } },
+    });
+    console.log(`[approveBooking] ${pro.fullName} confirmed for "${siteName}" on ${date}`);
 
     // Mark the matching pending message as approved and set assigned:true on the site
     const approvedMsg = await Message.findOneAndUpdate(
@@ -204,9 +203,13 @@ export async function updateSchedule(req, res, next) {
 }
 
 // GET /api/trade/messages
+// Returns availability requests + approvals sent TO this trade pro (not their own applications)
 export async function getMessages(req, res, next) {
   try {
-    const messages = await Message.find({ tradePro: req.userId })
+    const messages = await Message.find({
+      tradePro: req.userId,
+      type: { $in: ['availability', 'approval'] },
+    })
       .populate('site',       'name address type photo tradesNeeded')
       .populate('contractor', 'companyName email')
       .sort({ createdAt: -1 })
@@ -229,23 +232,20 @@ export async function approveMessage(req, res, next) {
     msg.status = 'approved';
     await msg.save();
 
-    // Push booking into TradePro bookings using dates[] array format
-    const alreadyBooked = await TradePro.findOne({
-      _id: req.userId,
-      'bookings.dates': msg.requestedDate,
-      'bookings.siteName': msg.site.name,
+    // Always replace any existing entry for this site (could be 'order' from applyForJob)
+    // with a confirmed 'booked' entry so the calendar shows RED not amber.
+    await TradePro.findByIdAndUpdate(req.userId, {
+      $pull: { bookings: { siteId: msg.site._id } },
     });
-    if (!alreadyBooked) {
-      await TradePro.findByIdAndUpdate(req.userId, {
-        $push: { bookings: {
-          siteId:      msg.site._id,
-          siteName:    msg.site.name,
-          siteAddress: msg.site.address,
-          dates:       [msg.requestedDate],
-          status:      'booked',
-        }},
-      });
-    }
+    await TradePro.findByIdAndUpdate(req.userId, {
+      $push: { bookings: {
+        siteId:      msg.site._id,
+        siteName:    msg.site.name,
+        siteAddress: msg.site.address,
+        dates:       [msg.requestedDate],
+        status:      'booked',
+      }},
+    });
 
     // Set assigned:true on the site's tradesNeeded entry immediately
     const pro = await TradePro.findById(req.userId).select('professionality');
@@ -285,7 +285,7 @@ export async function requestReschedule(req, res, next) {
     const site = await Site.findById(siteId).select('contractor name address');
     if (!site) return res.status(404).json({ message: 'Site not found' });
 
-    // Create pending availability message to contractor (same pattern as applyToJob)
+    // Create a reschedule request message to the contractor
     await Message.create({
       tradePro:      req.userId,
       site:          siteId,
@@ -293,7 +293,7 @@ export async function requestReschedule(req, res, next) {
       requestedDate: newDate,
       status:        'pending',
       senderType:    'trade',
-      type:          'availability',
+      type:          'reschedule',
     });
 
     res.json({ ok: true, siteName: site.name });
@@ -332,7 +332,7 @@ export async function removeBooking(req, res, next) {
 // GET /api/trade/find-jobs?distance=25&unit=mi
 export async function findJobs(req, res, next) {
   try {
-    const pro = await TradePro.findById(req.userId).select('professionality location hourlyRate');
+    const pro = await TradePro.findById(req.userId).select('professionality location hourlyRate bookings');
     if (!pro) return res.status(404).json({ message: 'Trade pro not found' });
 
     const [lng, lat] = pro.location.coordinates;
@@ -346,6 +346,21 @@ export async function findJobs(req, res, next) {
       : parseFloat(distance) * 1609.344;
 
     const professionality = pro.professionality;
+
+    // ── Build exclusion sets from confirmed bookings (status:'booked') ────────
+    // bookedSiteIds : sites this trade is already working on → hide entirely
+    // bookedDates   : confirmed dates → hide any site whose requiredDate clashes
+    const confirmedBookings = (pro.bookings ?? []).filter(b => b.status === 'booked');
+    const bookedSiteIds = new Set(confirmedBookings.filter(b => b.siteId).map(b => String(b.siteId)));
+    const bookedDates   = new Set(confirmedBookings.flatMap(b => b.dates ?? []));
+
+    // Also exclude sites where the trade already has an accepted application
+    const acceptedSiteIds = await Message.find({
+      tradePro: req.userId,
+      type:     'application',
+      status:   'accepted',
+    }).distinct('site');
+    acceptedSiteIds.forEach(id => bookedSiteIds.add(String(id)));
 
     // Geocode any active sites that still have placeholder [0,0] coordinates
     const ungeocoded = await Site.find({
@@ -403,22 +418,35 @@ export async function findJobs(req, res, next) {
     const sites = await Site.aggregate(pipeline);
     console.log(`[findJobs] pro=${req.userId} trade="${professionality}" lat=${lat} lng=${lng} dist=${meters}m → ${sites.length} site(s) found`);
 
-    const results = sites.map((site) => {
-      const trade = site.tradesNeeded.find(
-        (t) => t.name.toLowerCase() === professionality.toLowerCase() && !t.assigned
-      );
-      return {
-        _id:            site._id,
-        name:           site.name,
-        address:        site.address,
-        type:           site.type,
-        photo:          site.photo,
-        distanceMeters: site.distanceMeters,
-        tradeEntry:     trade || null,
-        contractorId:   site.contractorInfo?._id || null,
-        contractorName: site.contractorInfo?.companyName || null,
-      };
-    });
+    const results = sites
+      .filter(site => {
+        // Hide sites the trade is already confirmed/booked on
+        if (bookedSiteIds.has(String(site._id))) return false;
+
+        // Hide sites whose requiredDate clashes with a confirmed booked date
+        const tradeEntry = site.tradesNeeded?.find(
+          (t) => t.name.toLowerCase() === professionality.toLowerCase()
+        );
+        if (tradeEntry?.requiredDate && bookedDates.has(tradeEntry.requiredDate)) return false;
+
+        return true;
+      })
+      .map((site) => {
+        const trade = site.tradesNeeded.find(
+          (t) => t.name.toLowerCase() === professionality.toLowerCase() && !t.assigned
+        );
+        return {
+          _id:            site._id,
+          name:           site.name,
+          address:        site.address,
+          type:           site.type,
+          photo:          site.photo,
+          distanceMeters: site.distanceMeters,
+          tradeEntry:     trade || null,
+          contractorId:   site.contractorInfo?._id || null,
+          contractorName: site.contractorInfo?.companyName || null,
+        };
+      });
 
     res.json({ results, professionality, hourlyRate: pro.hourlyRate ?? null });
   } catch (err) {
@@ -447,10 +475,11 @@ export async function applyToJob(req, res, next) {
       return res.status(409).json({ assigned: true, siteName: site.name });
     }
 
-    // Upsert: update existing pending application (new date) or create fresh one
-    await Application.findOneAndUpdate(
-      { tradePro: req.userId, site: siteId },
-      { $set: { contractor: site.contractor._id, scheduledDate: date || null, status: 'pending' } },
+    // Upsert: single Message record with type:'application' replaces the old
+    // Application collection — one document tracks the whole flow.
+    await Message.findOneAndUpdate(
+      { tradePro: req.userId, site: siteId, type: 'application' },
+      { $set: { contractor: site.contractor._id, requestedDate: date || '', status: 'pending', senderType: 'trade' } },
       { upsert: true, new: true }
     );
 
@@ -466,17 +495,6 @@ export async function applyToJob(req, res, next) {
         $push: { bookings: { siteId: site._id, siteName: site.name, siteAddress: site.address, dates, status: 'order' } },
       });
     }
-
-    // Record application as a pending trade message
-    await Message.create({
-      tradePro:      req.userId,
-      site:          siteId,
-      contractor:    site.contractor._id,
-      requestedDate: date || '',
-      status:        'pending',
-      senderType:    'trade',
-      type:          'availability',
-    });
 
     // Email to contractor
     const locale      = lang === 'es' ? 'es-ES' : 'en-US';

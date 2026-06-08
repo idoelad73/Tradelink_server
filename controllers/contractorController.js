@@ -1,6 +1,5 @@
 import Contractor from '../models/Contractor.js';
 import Site from '../models/Site.js';
-import Application from '../models/Application.js';
 
 // Normalises incoming tradesNeeded — accepts string array OR {name,assigned} object array
 function normalizeTrades(raw) {
@@ -287,6 +286,7 @@ export async function askAvailability(req, res, next) {
         contractor:    req.userId,
         requestedDate: date,
         status:        'pending',
+        type:          'availability',
         senderType:    'contractor',
       });
     }
@@ -438,6 +438,7 @@ export async function requestWorkPlanDate(req, res, next) {
       contractor:    req.userId,
       requestedDate: requiredDate,
       status:        'pending',
+      type:          'availability',
       senderType:    'contractor',
     });
     await TradePro.findByIdAndUpdate(pro._id, { $inc: { availabilityMessages: 1 } });
@@ -481,42 +482,45 @@ export async function deleteWorkPlanTrade(req, res, next) {
 }
 
 // GET /api/contractor/applications
+// Everything now lives in the messages collection — applications are type:'application',
+// reschedule requests are type:'reschedule'. No separate Application model needed.
 export async function getApplications(req, res, next) {
   try {
-    const siteIds = await Site.find({ contractor: req.userId }).distinct('_id');
-    const applications = await Application.find({ site: { $in: siteIds } })
+    // Load all applications (trade-side requests) for this contractor's sites
+    const applications = await Message.find({
+      contractor: req.userId,
+      type:       'application',
+    })
       .populate('tradePro', 'fullName professionality photo hourlyRate')
       .populate('site',     'name address type photo tradesNeeded')
       .sort({ createdAt: -1 })
       .lean();
 
-    // Query messages collection: find tradePro+date pairs that are already approved
+    // Build a Set of "tradeProId:date" for already-approved trades
     const approvedMsgs = await Message.find({
       contractor: req.userId,
       status:     'approved',
       type:       'approval',
     }).select('tradePro requestedDate').lean();
 
-    // Build Set of "tradeProId:date" — a trade pro already confirmed for a date
     const bookedKeys = new Set(
       approvedMsgs
         .filter(m => m.tradePro && m.requestedDate)
         .map(m => `${String(m.tradePro)}:${m.requestedDate}`)
     );
 
-    // Flag pending applications where this trade pro is already booked on that date
+    // Flag pending applications where that trade pro is already booked on that date
     const marked = applications.map(app => {
       if (app.status === 'accepted') return app;
-      const key = `${String(app.tradePro?._id)}:${app.scheduledDate || ''}`;
+      const key = `${String(app.tradePro?._id)}:${app.requestedDate || ''}`;
       return bookedKeys.has(key) ? { ...app, _alreadyBooked: true } : app;
     });
 
-    // Also fetch pending reschedule requests sent by trade pros (Message, senderType:'trade')
+    // Reschedule requests sent by trade pros
     const rescheduleRequests = await Message.find({
-      contractor:  req.userId,
-      status:      'pending',
-      senderType:  'trade',
-      type:        'availability',
+      contractor: req.userId,
+      status:     'pending',
+      type:       'reschedule',
     })
       .populate('tradePro', 'fullName professionality photo hourlyRate')
       .populate('site',     'name address type photo tradesNeeded')
@@ -539,7 +543,7 @@ export async function approveReschedule(req, res, next) {
       _id:        req.params.id,
       contractor: req.userId,
       status:     'pending',
-      senderType: 'trade',
+      type:       'reschedule',
     }).populate('tradePro', 'fullName professionality');
     if (!msg) return res.status(404).json({ message: 'Request not found' });
 
@@ -589,7 +593,7 @@ export async function approveReschedule(req, res, next) {
 // Contractor declines a trade pro's reschedule request → delete the message
 export async function declineReschedule(req, res, next) {
   try {
-    await Message.deleteOne({ _id: req.params.id, contractor: req.userId, status: 'pending', senderType: 'trade' });
+    await Message.deleteOne({ _id: req.params.id, contractor: req.userId, status: 'pending', type: 'reschedule' });
     res.json({ ok: true });
   } catch (err) {
     next(err);
@@ -601,7 +605,8 @@ export async function approveApplication(req, res, next) {
   try {
     const { scheduledDate } = req.body; // YYYY-MM-DD
 
-    const app = await Application.findById(req.params.id)
+    // Application is now stored as a Message with type:'application'
+    const app = await Message.findOne({ _id: req.params.id, type: 'application' })
       .populate('tradePro', 'professionality fullName email')
       .populate('site',     'name address tradesNeeded contractor');
     if (!app) return res.status(404).json({ message: 'Application not found' });
@@ -620,10 +625,10 @@ export async function approveApplication(req, res, next) {
     }
 
     app.status = 'accepted';
-    if (scheduledDate) app.scheduledDate = scheduledDate;
+    if (scheduledDate) app.requestedDate = scheduledDate;
     await app.save();
 
-    const finalDate = app.scheduledDate || scheduledDate || null;
+    const finalDate = app.requestedDate || scheduledDate || null;
 
     // Mark the matching trade as assigned + store the trade pro's ID
     await Site.updateOne(
@@ -710,7 +715,8 @@ export async function approveApplication(req, res, next) {
     // Check messages collection: find any other pending applications from the
     // same trade pro on the same date so the client can gray them out immediately
     const siblingApplicationIds = finalDate
-      ? await Application.find({
+      ? await Message.find({
+          type:    'application',
           site:    { $in: await Site.find({ contractor: req.userId }).distinct('_id') },
           tradePro: app.tradePro._id,
           status:   'pending',
@@ -811,6 +817,20 @@ export async function findTrades(req, res, next) {
             { hourlyRate: null },
             { hourlyRate: { $exists: false } },
           ],
+        },
+      });
+    }
+
+    // ── HARD FILTER: exclude trades already booked on the requiredDate ────────
+    // A trade is "booked" when an approval pushed their date into bookings[].dates.
+    // Also exclude trades who manually marked that day as busy (busyDays).
+    if (requiredDate) {
+      pipeline.push({
+        $match: {
+          // must NOT have requiredDate in any booking's dates array
+          'bookings.dates': { $nin: [requiredDate] },
+          // must NOT have requiredDate in their personal busyDays
+          busyDays: { $nin: [requiredDate] },
         },
       });
     }
