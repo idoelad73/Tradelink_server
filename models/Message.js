@@ -4,17 +4,20 @@ const { Schema } = mongoose;
 /**
  * Unified "JobRequest / Message" collection.
  *
- * type        | senderType  | meaning
- * ------------|-------------|----------------------------------------------
- * application | trade       | Trade pro applied to work on a site
- * availability| contractor  | Contractor asked if trade is available on a date
- * approval    | contractor  | Contractor approved (via application or availability)
- * reschedule  | trade       | Trade pro asked to change their booked date
+ * type        | senderType  | status             | meaning
+ * ------------|-------------|--------------------|-----------------------------------------
+ * application | trade       | pending/approved   | Trade pro applied to work on a site
+ * availability| contractor  | pending            | Contractor asked if trade is available
+ * approval    | contractor  | approved           | Contractor approved the trade
+ * reschedule  | trade       | pending            | Trade pro asked to change booked date
+ * payment     | trade       | pending            | Trade submitted hours (no WorkHoursOrder yet)
+ * payment     | contractor  | approved           | Contractor approved → WorkHoursOrder created
+ * payment     | contractor  | rejected           | Contractor rejected → snapshot in text field
  */
 const messageSchema = new Schema(
   {
     tradePro:      { type: Schema.Types.ObjectId, ref: 'TradePro',   required: true, index: true },
-    site:          { type: Schema.Types.ObjectId, ref: 'Site',       required: true },
+    site:          { type: Schema.Types.ObjectId, ref: 'Site',       default: null },
     contractor:    { type: Schema.Types.ObjectId, ref: 'Contractor', required: true },
     requestedDate: { type: String, default: '' },   // YYYY-MM-DD
     text:          { type: String, default: '' },
@@ -26,7 +29,7 @@ const messageSchema = new Schema(
     },
     type: {
       type:     String,
-      enum:     ['application', 'availability', 'approval', 'reschedule'],
+      enum:     ['application', 'availability', 'approval', 'reschedule', 'payment'],
       required: true,
     },
     senderType: {

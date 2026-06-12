@@ -578,9 +578,36 @@ export async function applyToJob(req, res, next) {
   }
 }
 
+// GET /api/trade/work-log/check?siteId=...&date=...
+// Returns { hasPending: bool } — true if there is already a pending payment
+// message for this trade + site + date. Used by the client to disable the
+// clock icon so a trade cannot submit duplicate hours for the same day.
+export async function checkWorkLog(req, res, next) {
+  try {
+    const { siteId, date } = req.query;
+    if (!siteId || !date) {
+      return res.status(400).json({ message: 'siteId and date are required' });
+    }
+
+    const existing = await Message.findOne({
+      tradePro:      req.userId,
+      site:          siteId,
+      requestedDate: date,
+      type:          'payment',
+      status:        'pending',
+    }).lean();
+
+    res.json({ hasPending: !!existing });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // POST /api/trade/work-log
-// Trade pro submits actual hours worked for a booking date → stored in tradehours_orders.
-// order_sum = actual_hours * trade pro's hourlyRate at time of submission.
+// Trade pro submits actual hours worked for a booking date.
+// Creates a payment_pending Message — tradehours_orders is ONLY written to when
+// the contractor approves (via updatePaymentApproval). This keeps the collection
+// as a clean approved-only billing ledger.
 export async function submitWorkLog(req, res, next) {
   try {
     const { siteId, date, totalSeconds } = req.body;
@@ -594,29 +621,117 @@ export async function submitWorkLog(req, res, next) {
       return res.status(400).json({ message: 'totalSeconds must be a positive number' });
     }
 
-    // Fetch trade pro for hourlyRate
-    const pro = await TradePro.findById(req.userId).select('hourlyRate');
-    if (!pro) return res.status(404).json({ message: 'Trade pro not found' });
+    // Fetch both in parallel — site for contractor ref, pro for current hourlyRate
+    const [site, pro] = await Promise.all([
+      Site.findById(siteId).select('contractor').lean(),
+      TradePro.findById(req.userId).select('hourlyRate').lean(),
+    ]);
 
-    // Fetch site for contractor reference
-    const site = await Site.findById(siteId).select('contractor');
     if (!site) return res.status(404).json({ message: 'Site not found' });
+    if (!pro)  return res.status(404).json({ message: 'Trade pro not found' });
 
     const actual_hours = parseFloat((totalSec / 3600).toFixed(2));
-    const order_sum    = pro.hourlyRate
-      ? parseFloat((actual_hours * pro.hourlyRate).toFixed(2))
-      : 0;
+    const hourly_rate  = pro.hourlyRate ?? null;
+    const order_sum    = parseFloat(((actual_hours) * (hourly_rate ?? 0)).toFixed(2));
 
-    const workLog = await WorkHoursOrder.create({
-      contractor_id: site.contractor,
-      trade_id:      req.userId,
-      site_id:       siteId,
-      date,
-      actual_hours,
-      order_sum,
+    // Store as a pending payment message — contractor will approve/reject from their dashboard.
+    // The snapshot (hours / rate / sum) is JSON-encoded in the text field so the
+    // data is preserved until the contractor acts. type='payment', status drives the colour.
+    const workLog = await Message.create({
+      tradePro:      req.userId,
+      site:          siteId,
+      contractor:    site.contractor,
+      requestedDate: date,
+      text:          JSON.stringify({ actual_hours, hourly_rate, order_sum }),
+      status:        'pending',
+      type:          'payment',
+      senderType:    'trade',
     });
 
     res.status(201).json({ workLog });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/trade/payment-approved/count
+// Badge count — all payment messages (any status) so the trade always sees
+// any activity on their submitted hours.
+export async function getPaymentApprovedCount(req, res, next) {
+  try {
+    const count = await Message.countDocuments({
+      tradePro: req.userId,
+      type:     'payment',
+    });
+    res.json({ count });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/trade/payment-approved
+// Returns:
+//   orders   — approved tradehours_orders (clean billing ledger)
+//   rejected — payment_rejected messages (snapshot in text field)
+//   pending  — payment_pending messages (submitted, awaiting contractor action)
+// tradehours_orders is a clean approved-only ledger; all other states live in messages.
+export async function getPaymentApproved(req, res, next) {
+  try {
+    const [orders, rejectedMsgs, pendingMsgs] = await Promise.all([
+      WorkHoursOrder.find({ trade_id: req.userId, status: 'approved' })
+        .populate('site_id',       'name address')
+        .populate('contractor_id', 'companyName')
+        .sort({ createdAt: -1 })
+        .lean(),
+
+      Message.find({ tradePro: req.userId, type: 'payment', status: 'rejected' })
+        .populate('site',       'name address')
+        .populate('contractor', 'companyName')
+        .sort({ createdAt: -1 })
+        .lean(),
+
+      Message.find({ tradePro: req.userId, type: 'payment', status: 'pending' })
+        .populate('site',       'name address')
+        .populate('contractor', 'companyName')
+        .sort({ createdAt: -1 })
+        .lean(),
+    ]);
+
+    const parseSnap = (m) => { try { return JSON.parse(m.text || '{}'); } catch { return {}; } };
+
+    // Normalize rejected messages into the same shape as order rows
+    const rejected = rejectedMsgs.map((m) => {
+      const snapshot = parseSnap(m);
+      return {
+        _id:           m._id,
+        _isRejected:   true,
+        date:          m.requestedDate,
+        site_id:       m.site       ?? null,
+        contractor_id: m.contractor ?? null,
+        actual_hours:  snapshot.actual_hours ?? 0,
+        hourly_rate:   snapshot.hourly_rate  ?? null,
+        order_sum:     snapshot.order_sum    ?? 0,
+        createdAt:     m.createdAt,
+      };
+    });
+
+    // Normalize pending messages the same way
+    const pending = pendingMsgs.map((m) => {
+      const snapshot = parseSnap(m);
+      return {
+        _id:           m._id,
+        _isPending:    true,
+        date:          m.requestedDate,
+        site_id:       m.site       ?? null,
+        contractor_id: m.contractor ?? null,
+        actual_hours:  snapshot.actual_hours ?? 0,
+        hourly_rate:   snapshot.hourly_rate  ?? null,
+        order_sum:     snapshot.order_sum    ?? 0,
+        createdAt:     m.createdAt,
+      };
+    });
+
+    res.json({ orders, rejected, pending });
   } catch (err) {
     next(err);
   }

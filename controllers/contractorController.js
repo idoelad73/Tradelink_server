@@ -20,6 +20,7 @@ function normalizeTrades(raw) {
 }
 import TradePro from '../models/TradePro.js';
 import Message from '../models/Message.js';
+import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
 import { sendMail } from '../utils/mailer.js';
@@ -890,3 +891,140 @@ export async function findTrades(req, res, next) {
   }
 }
 
+// ── Payment Approvals ────────────────────────────────────────────────────────
+// tradehours_orders is APPROVED-ONLY. Pending requests arrive as payment_pending
+// Messages. On approve: create WorkHoursOrder (approved) + payment_approved msg
+// + delete the pending msg. On reject: create payment_rejected msg + delete pending.
+
+// GET /api/contractor/payment-approvals/count
+// Badge count — payment messages with status 'pending' awaiting contractor action.
+export async function getPaymentApprovalsCount(req, res, next) {
+  try {
+    const pendingCount = await Message.countDocuments({
+      contractor: req.userId,
+      type:       'payment',
+      status:     'pending',
+    });
+    res.json({ pendingCount });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/contractor/payment-approvals
+// Returns pending payment messages shaped to look like order objects so the
+// existing UI (PaymentApprovalsPage) works without changes.
+export async function getPaymentApprovals(req, res, next) {
+  try {
+    const msgs = await Message.find({ contractor: req.userId, type: 'payment', status: 'pending' })
+      .populate('tradePro', 'fullName professionality photo hourlyRate')
+      .populate('site',     'name address')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const orders = msgs.map((m) => {
+      const snap = (() => { try { return JSON.parse(m.text || '{}'); } catch { return {}; } })();
+      // Use live rate from TradePro if available, fall back to snapshot
+      const liveRate = m.tradePro?.hourlyRate ?? snap.hourly_rate ?? null;
+      const actual   = snap.actual_hours ?? 0;
+      return {
+        _id:          m._id,           // this IS the message _id — used in updatePaymentApproval
+        trade_id:     m.tradePro,
+        site_id:      m.site,
+        date:         m.requestedDate,
+        actual_hours: actual,
+        hourly_rate:  liveRate,
+        order_sum:    liveRate ? parseFloat((actual * liveRate).toFixed(2)) : 0,
+        status:       'pending',
+        createdAt:    m.createdAt,
+      };
+    });
+
+    res.json({ orders });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /api/contractor/payment-approvals/:orderId
+// Body: { status: 'approved' | 'rejected' }
+// orderId is the _id of the pending payment Message (not a WorkHoursOrder).
+// On approval : create WorkHoursOrder (approved, amounts locked) + payment msg (approved) + delete pending msg.
+// On rejection: create payment msg (rejected, snapshot in text) + delete pending msg.
+export async function updatePaymentApproval(req, res, next) {
+  try {
+    const { orderId } = req.params;
+    const { status }  = req.body;
+
+    if (!['approved', 'rejected'].includes(status)) {
+      return res.status(400).json({ message: 'status must be "approved" or "rejected"' });
+    }
+
+    // The "order" is actually a pending payment message
+    const pendingMsg = await Message.findOne({ _id: orderId, contractor: req.userId, type: 'payment', status: 'pending' })
+      .populate('tradePro', 'fullName professionality photo hourlyRate')
+      .populate('site',     'name address')
+      .lean();
+
+    if (!pendingMsg) return res.status(404).json({ message: 'Pending request not found' });
+
+    const snap = (() => { try { return JSON.parse(pendingMsg.text || '{}'); } catch { return {}; } })();
+    const liveRate   = pendingMsg.tradePro?.hourlyRate ?? snap.hourly_rate ?? null;
+    const actual     = snap.actual_hours ?? 0;
+    const lockedSum  = liveRate ? parseFloat((actual * liveRate).toFixed(2)) : 0;
+    const tradeId    = pendingMsg.tradePro._id ?? pendingMsg.tradePro;
+    const siteId     = pendingMsg.site?._id    ?? pendingMsg.site ?? null;
+
+    // ── REJECTION ────────────────────────────────────────────────────────────
+    if (status === 'rejected') {
+      await Promise.all([
+        Message.create({
+          tradePro:      tradeId,
+          site:          siteId,
+          contractor:    req.userId,
+          requestedDate: pendingMsg.requestedDate,
+          text:       JSON.stringify({ actual_hours: actual, hourly_rate: liveRate, order_sum: lockedSum }),
+          status:     'rejected',
+          type:       'payment',
+          senderType: 'contractor',
+        }),
+        Message.findByIdAndDelete(orderId),
+      ]);
+      return res.json({ deleted: true, _id: orderId });
+    }
+
+    // ── APPROVAL ─────────────────────────────────────────────────────────────
+    // Create the WorkHoursOrder now (first and only time it enters the collection).
+    const [newOrder] = await Promise.all([
+      WorkHoursOrder.create({
+        contractor_id: req.userId,
+        trade_id:      tradeId,
+        site_id:       siteId,
+        date:          pendingMsg.requestedDate,
+        actual_hours:  actual,
+        hourly_rate:   liveRate,
+        order_sum:     lockedSum,
+        status:        'approved',
+      }),
+      Message.create({
+        tradePro:      tradeId,
+        site:          siteId,
+        contractor:    req.userId,
+        requestedDate: pendingMsg.requestedDate,
+        status:        'approved',
+        type:          'payment',
+        senderType:    'contractor',
+      }),
+      Message.findByIdAndDelete(orderId),
+    ]);
+
+    const populated = await WorkHoursOrder.findById(newOrder._id)
+      .populate('trade_id', 'fullName professionality photo hourlyRate')
+      .populate('site_id',  'name address')
+      .lean();
+
+    res.json({ deleted: true, _id: orderId, order: populated });
+  } catch (err) {
+    next(err);
+  }
+}

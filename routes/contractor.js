@@ -9,6 +9,7 @@ import {
   getNotifications, markNotificationsRead,
   getWorkPlan, updateWorkPlanDate, deleteWorkPlanTrade, requestWorkPlanDate,
   approveReschedule, declineReschedule,
+  getPaymentApprovalsCount, getPaymentApprovals, updatePaymentApproval,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -37,6 +38,11 @@ router.patch('/messages/:id/decline-reschedule',   declineReschedule);
 // Availability-approved notifications
 router.get('/notifications',       getNotifications);
 router.patch('/notifications/read', markNotificationsRead);
+
+// Payment approvals (tradehours_orders)
+router.get('/payment-approvals/count',       getPaymentApprovalsCount);
+router.get('/payment-approvals',             getPaymentApprovals);
+router.patch('/payment-approvals/:orderId',  updatePaymentApproval);
 
 // Sites — full CRUD
 router.post('/sites',       upload.single('photo'), createSite);

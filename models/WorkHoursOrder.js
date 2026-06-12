@@ -4,7 +4,16 @@ const { Schema } = mongoose;
 
 /**
  * tradehours_orders collection
- * Created when a trade pro submits actual hours worked for contractor approval.
+ *
+ * order_sum is computed by the pre-save hook: actual_hours × hourly_rate.
+ * hourly_rate is written by the controller (fetched from TradePro at submit time).
+ *
+ * GET /payment-approvals always re-enriches from the *current* TradePro.hourlyRate
+ * so the displayed amount stays in sync if the rate changes after submission.
+ *
+ * At approval time the controller locks in both hourly_rate + order_sum via
+ * findByIdAndUpdate (bypasses the hook intentionally) so the frozen amount
+ * is preserved in the record regardless of future rate changes.
  */
 const workHoursOrderSchema = new Schema(
   {
@@ -21,8 +30,8 @@ const workHoursOrderSchema = new Schema(
       index:    true,
     },
     site_id: {
-      type: Schema.Types.ObjectId,
-      ref:  'Site',
+      type:    Schema.Types.ObjectId,
+      ref:     'Site',
       default: null,
     },
     date: {
@@ -30,11 +39,15 @@ const workHoursOrderSchema = new Schema(
       required: true,
     },
     actual_hours: {
-      type:     Number,   // e.g. 7.5 (totalSeconds / 3600, 2 dp)
+      type:     Number,   // totalSeconds / 3600, rounded to 2 dp
       required: true,
     },
+    hourly_rate: {
+      type:    Number,    // TradePro.hourlyRate at the time this record was last enriched
+      default: null,
+    },
     order_sum: {
-      type:    Number,    // actual_hours * trade pro's hourlyRate at time of submission
+      type:    Number,    // actual_hours × hourly_rate — set by controller, not a hook
       default: 0,
     },
     status: {
@@ -46,10 +59,25 @@ const workHoursOrderSchema = new Schema(
   { timestamps: true, collection: 'tradehours_orders' }
 );
 
-// Compound: quickly list all orders for a contractor sorted newest first
 workHoursOrderSchema.index({ contractor_id: 1, createdAt: -1 });
-// Compound: quickly list all orders for a trade pro
-workHoursOrderSchema.index({ trade_id: 1, createdAt: -1 });
+workHoursOrderSchema.index({ trade_id: 1,     createdAt: -1 });
+
+/**
+ * Pre-save hook — synchronous (no async, uses next callback).
+ * This is the ONLY safe pattern that guarantees `this.*` mutations
+ * are persisted before Mongoose writes to MongoDB.
+ * Recalculates order_sum every time a document is created or saved.
+ */
+workHoursOrderSchema.pre('save', function (next) {
+  const hours = this.actual_hours;
+  const rate  = this.hourly_rate;
+  if (hours != null && rate != null) {
+    this.order_sum = parseFloat((hours * rate).toFixed(2));
+  } else {
+    this.order_sum = 0;
+  }
+  next();
+});
 
 const WorkHoursOrder = mongoose.model('WorkHoursOrder', workHoursOrderSchema);
 export default WorkHoursOrder;
