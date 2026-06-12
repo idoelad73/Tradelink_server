@@ -621,9 +621,9 @@ export async function submitWorkLog(req, res, next) {
       return res.status(400).json({ message: 'totalSeconds must be a positive number' });
     }
 
-    // Fetch both in parallel — site for contractor ref, pro for current hourlyRate
+    // Fetch both in parallel — site for contractor ref + name, pro for current hourlyRate
     const [site, pro] = await Promise.all([
-      Site.findById(siteId).select('contractor').lean(),
+      Site.findById(siteId).select('contractor').populate('contractor', 'companyName').lean(),
       TradePro.findById(req.userId).select('hourlyRate').lean(),
     ]);
 
@@ -648,7 +648,8 @@ export async function submitWorkLog(req, res, next) {
       senderType:    'trade',
     });
 
-    res.status(201).json({ workLog });
+    const contractorName = site.contractor?.companyName ?? '';
+    res.status(201).json({ workLog, contractorName });
   } catch (err) {
     next(err);
   }
