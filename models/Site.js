@@ -24,6 +24,7 @@ const siteSchema = new Schema(
       maxAmount:    { type: Number, default: null },
       totalHours:   { type: Number, default: null },
       requiredDate: { type: String, default: null }, // YYYY-MM-DD
+      workers_no:   { type: Number, default: null }, // number of workers needed
     }],
 
     photo:  { type: String, default: null }, // Cloudinary URL

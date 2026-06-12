@@ -2,6 +2,7 @@ import TradePro from '../models/TradePro.js';
 import Contractor from '../models/Contractor.js';
 import Message from '../models/Message.js';
 import Site from '../models/Site.js';
+import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import jwt from 'jsonwebtoken';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
@@ -577,4 +578,46 @@ export async function applyToJob(req, res, next) {
   }
 }
 
+// POST /api/trade/work-log
+// Trade pro submits actual hours worked for a booking date → stored in tradehours_orders.
+// order_sum = actual_hours * trade pro's hourlyRate at time of submission.
+export async function submitWorkLog(req, res, next) {
+  try {
+    const { siteId, date, totalSeconds } = req.body;
 
+    if (!siteId || !date || totalSeconds == null) {
+      return res.status(400).json({ message: 'siteId, date and totalSeconds are required' });
+    }
+
+    const totalSec = Number(totalSeconds);
+    if (!Number.isFinite(totalSec) || totalSec <= 0) {
+      return res.status(400).json({ message: 'totalSeconds must be a positive number' });
+    }
+
+    // Fetch trade pro for hourlyRate
+    const pro = await TradePro.findById(req.userId).select('hourlyRate');
+    if (!pro) return res.status(404).json({ message: 'Trade pro not found' });
+
+    // Fetch site for contractor reference
+    const site = await Site.findById(siteId).select('contractor');
+    if (!site) return res.status(404).json({ message: 'Site not found' });
+
+    const actual_hours = parseFloat((totalSec / 3600).toFixed(2));
+    const order_sum    = pro.hourlyRate
+      ? parseFloat((actual_hours * pro.hourlyRate).toFixed(2))
+      : 0;
+
+    const workLog = await WorkHoursOrder.create({
+      contractor_id: site.contractor,
+      trade_id:      req.userId,
+      site_id:       siteId,
+      date,
+      actual_hours,
+      order_sum,
+    });
+
+    res.status(201).json({ workLog });
+  } catch (err) {
+    next(err);
+  }
+}

@@ -6,7 +6,7 @@ function normalizeTrades(raw) {
   const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
   return arr.map((t) =>
     typeof t === 'string'
-      ? { name: t, assigned: false, budgetType: null, maxAmount: null, totalHours: null, requiredDate: null }
+      ? { name: t, assigned: false, budgetType: null, maxAmount: null, totalHours: null, requiredDate: null, workers_no: null }
       : {
           name:         t.name,
           assigned:     t.assigned     ?? false,
@@ -14,6 +14,7 @@ function normalizeTrades(raw) {
           maxAmount:    t.maxAmount    ?? null,
           totalHours:   t.totalHours   ?? null,
           requiredDate: t.requiredDate ?? null,
+          workers_no:   t.workers_no   ?? t.workersNeeded ?? null, // accept both field names from client
         }
   );
 }

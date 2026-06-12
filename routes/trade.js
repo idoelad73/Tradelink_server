@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { protect, restrictTo } from '../middleware/auth.js';
 import { photoUpload, handleUploadError } from '../middleware/upload.js';
-import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking } from '../controllers/tradeController.js';
+import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking, submitWorkLog } from '../controllers/tradeController.js';
 
 const router = Router();
 
@@ -21,5 +21,6 @@ router.patch('/schedule',   updateSchedule);
 router.patch('/location',   updateLocation);
 router.post('/reschedule',  requestReschedule);
 router.delete('/bookings',  removeBooking);
+router.post('/work-log',    submitWorkLog);
 
 export default router;
