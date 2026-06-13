@@ -38,6 +38,10 @@ const tradeProSchema = new Schema(
       status:      { type: String, enum: ['order', 'booked'], default: 'booked' },
     }],
 
+    // ── Stripe Connect — store only Stripe IDs, never card data ─
+    stripeAccountId: { type: String,  default: null  }, // Express connected account
+    stripeOnboarded: { type: Boolean, default: false }, // true after charges_enabled
+
     // ── Session tracking ─────────────────────────────────────
     isLoggedIn:           { type: Boolean, default: false },
     lastLogin:            { type: Date,    default: null  },

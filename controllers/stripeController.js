@@ -1,6 +1,10 @@
-import stripe from '../utils/stripe.js';
+import stripe       from '../utils/stripe.js';
 import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import Contractor     from '../models/Contractor.js';
+import TradePro       from '../models/TradePro.js';
+
+// Platform fee % read from .env — e.g. STRIPE_PLATFORM_FEE_PERCENT=5  means 5%
+const PLATFORM_FEE_PERCENT = parseFloat(process.env.STRIPE_PLATFORM_FEE_PERCENT ?? '0');
 
 // ── POST /api/stripe/create-payment-intent ────────────────────────────────────
 // Authenticated contractor only (auth middleware applied in route).
@@ -22,7 +26,7 @@ export async function createPaymentIntent(req, res, next) {
       contractor_id: req.userId,
       status:        'approved',
     })
-      .populate('trade_id', 'fullName professionality')
+      .populate('trade_id', 'fullName professionality stripeAccountId stripeOnboarded')
       .lean();
 
     if (!order) {
@@ -51,22 +55,48 @@ export async function createPaymentIntent(req, res, next) {
 
     const amountCents = Math.round(order.order_sum * 100); // Stripe works in cents
 
+    // ── Platform fee calculation ─────────────────────────────────────────────
+    const tradePro     = order.trade_id;
+    const feePercent   = PLATFORM_FEE_PERCENT;                                      // e.g. 5
+    const feeCents     = feePercent > 0 ? Math.round(amountCents * feePercent / 100) : 0;
+    const payoutCents  = amountCents - feeCents;                                     // TradePro's share
+    const feeDollars   = parseFloat((feeCents   / 100).toFixed(2));
+    const payoutDollars= parseFloat((payoutCents / 100).toFixed(2));
+
+    console.log(`[Stripe] Order $${order.order_sum} | Fee ${feePercent}% = $${feeDollars} | TradePro payout = $${payoutDollars}`);
+
     // ── Create PaymentIntent server-side (rule #7) ───────────────────────────
-    const paymentIntent = await stripe.paymentIntents.create(
-      {
-        amount:   amountCents,
-        currency: 'usd',
-        customer: customerId,
-        automatic_payment_methods: { enabled: true }, // enables Apple Pay, Google Pay + card
-        metadata: {
-          orderId:       String(order._id),
-          contractorId:  String(order.contractor_id),
-          tradeId:       String(order.trade_id._id),
-          date:          order.date,
-        },
-        description: `TradeLink — ${order.trade_id.fullName} (${order.trade_id.professionality}) ${order.date}`,
+    // application_fee_amount → automatically sent to TradeLink's Stripe platform account
+    // transfer_data.destination → sends the remainder to TradePro's connected account
+    const hasConnectAcct = tradePro?.stripeOnboarded && tradePro?.stripeAccountId;
+
+    const piParams = {
+      amount:   amountCents,
+      currency: 'usd',
+      customer: customerId,
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        orderId:       String(order._id),
+        contractorId:  String(order.contractor_id),
+        tradeId:       String(tradePro._id),
+        date:          order.date,
+        feePercent:    String(feePercent),
+        feeCents:      String(feeCents),
+        payoutCents:   String(payoutCents),
       },
-      // Idempotency key prevents duplicate charges on retries (rule #8)
+      description: `TradeLink — ${tradePro.fullName} (${tradePro.professionality}) ${order.date}`,
+    };
+
+    // Only split to TradePro's Stripe account if they have completed Connect onboarding
+    if (hasConnectAcct && feeCents > 0) {
+      piParams.application_fee_amount = feeCents;
+      piParams.transfer_data          = { destination: tradePro.stripeAccountId };
+    } else if (!hasConnectAcct) {
+      console.warn(`[Stripe] TradePro ${tradePro?._id} not connected — full $${order.order_sum} stays in platform account, fee tracked in DB only`);
+    }
+
+    const paymentIntent = await stripe.paymentIntents.create(
+      piParams,
       { idempotencyKey: `pi-${req.userId}-${orderId}` }
     );
 
@@ -126,16 +156,29 @@ export async function handleWebhook(req, res) {
         console.log(`   Email   : ${pi.billing_details?.email ?? pi.receipt_email ?? '—'}`);
         break;
 
-      case 'payment_intent.succeeded':
+      case 'payment_intent.succeeded': {
+        const feeCents    = parseInt(pi.metadata?.feeCents    ?? '0', 10);
+        const payoutCents = parseInt(pi.metadata?.payoutCents ?? '0', 10);
+        const feeDollars    = parseFloat((feeCents    / 100).toFixed(2));
+        const payoutDollars = parseFloat((payoutCents / 100).toFixed(2));
+
         console.log(`\n🎉 [Stripe] payment_intent.succeeded`);
-        console.log(`   PI ID   : ${piId}`);
-        console.log(`   Amount  : ${amount}`);
-        console.log(`   Order   : ${orderId ?? '—'}`);
+        console.log(`   PI ID       : ${piId}`);
+        console.log(`   Total       : ${amount}`);
+        console.log(`   TradePro    : $${payoutDollars}  (payment_sum)`);
+        console.log(`   Platform fee: $${feeDollars}  (fee_sum)`);
+        console.log(`   Order       : ${orderId ?? '—'}`);
+
         if (orderId) {
-          await WorkHoursOrder.findByIdAndUpdate(orderId, { paymentStatus: 'paid' });
-          console.log(`   DB      : paymentStatus → paid ✅`);
+          await WorkHoursOrder.findByIdAndUpdate(orderId, {
+            paymentStatus: 'paid',
+            payment_sum:   payoutDollars,
+            fee_sum:       feeDollars,
+          });
+          console.log(`   DB          : paymentStatus → paid ✅  |  payment_sum=$${payoutDollars}  fee_sum=$${feeDollars}`);
         }
         break;
+      }
 
       case 'charge.updated':
         console.log(`\n🔄 [Stripe] charge.updated`);

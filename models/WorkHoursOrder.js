@@ -62,6 +62,9 @@ const workHoursOrderSchema = new Schema(
       enum:    ['unpaid', 'pending', 'paid', 'failed'],
       default: 'unpaid',
     },
+    // Set when payment succeeds (webhook):
+    payment_sum: { type: Number, default: null }, // amount TradePro receives (order_sum - fee)
+    fee_sum:     { type: Number, default: null }, // platform commission amount
   },
   { timestamps: true, collection: 'tradehours_orders' }
 );
