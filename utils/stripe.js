@@ -1,15 +1,9 @@
 import Stripe from 'stripe';
 
-const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
-
-// Create a Stripe Connect account for a trade
-export async function createConnectAccount(email) {
-  // functional code added later
-}
-
-// Create a payment intent
-export async function createPaymentIntent(amount, currency = 'usd') {
-  // functional code added later
-}
+// Single Stripe instance — import this everywhere instead of calling new Stripe() again.
+// The secret key is read once at startup; if it's missing the app will throw early.
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, {
+  apiVersion: '2024-04-10',
+});
 
 export default stripe;

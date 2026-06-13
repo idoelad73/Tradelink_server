@@ -19,6 +19,9 @@ const contractorSchema = new Schema(
     isLoggedIn:  { type: Boolean, default: false },
     lastLogin:   { type: Date,    default: null  },
     loginCount:  { type: Number,  default: 0     },
+
+    // ── Stripe — store only Stripe IDs, never raw card data ──
+    stripeCustomerId: { type: String, default: null },
   },
   { timestamps: true }
 );

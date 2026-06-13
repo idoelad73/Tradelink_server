@@ -578,6 +578,22 @@ export async function applyToJob(req, res, next) {
   }
 }
 
+// GET /api/trade/approved-orders
+// Called on TradeDashboard mount. Returns minimal approved records so the client can:
+//   1. Colour those calendar days light-blue
+//   2. Disable the clock icon (can't log hours twice for an approved date)
+export async function getApprovedOrderDates(req, res, next) {
+  try {
+    const orders = await WorkHoursOrder.find({ trade_id: req.userId, status: 'approved' })
+      .select('date site_id')
+      .lean();
+    // Return as an array of { date, siteId } — small payload, fast to parse on client
+    res.json({ orders: orders.map(o => ({ date: o.date, siteId: String(o.site_id) })) });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // GET /api/trade/work-log/check?siteId=...&date=...
 // Returns { hasPending: bool } — true if there is already a pending payment
 // message for this trade + site + date. Used by the client to disable the

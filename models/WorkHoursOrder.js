@@ -55,6 +55,13 @@ const workHoursOrderSchema = new Schema(
       enum:    ['pending', 'approved', 'rejected'],
       default: 'pending',
     },
+    // ── Stripe payment tracking ──────────────────────────────────────────────
+    stripePaymentIntentId: { type: String, default: null },
+    paymentStatus: {
+      type:    String,
+      enum:    ['unpaid', 'pending', 'paid', 'failed'],
+      default: 'unpaid',
+    },
   },
   { timestamps: true, collection: 'tradehours_orders' }
 );

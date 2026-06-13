@@ -6,10 +6,7 @@ import authRoutes       from './auth.js';
 import contractorRoutes from './contractor.js';
 import tradeRoutes      from './trade.js';
 import chatRoutes       from './chat.js';
-// import userRoutes from './user.routes.js';
-// import jobRoutes from './job.routes.js';
-// import tradeRoutes from './trade.routes.js';
-// import stripeRoutes from './stripe.routes.js';
+import stripeRoutes     from './stripe.js';
 
 const router = Router();
 
@@ -17,10 +14,7 @@ router.use('/auth',       authRoutes);
 router.use('/contractor', contractorRoutes);
 router.use('/trade',      tradeRoutes);
 router.use('/chat',       chatRoutes);
-// router.use('/users',  userRoutes);
-// router.use('/jobs',   jobRoutes);
-// router.use('/trades', tradeRoutes);
-// router.use('/stripe', stripeRoutes);
+router.use('/stripe',     stripeRoutes);
 
 router.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
