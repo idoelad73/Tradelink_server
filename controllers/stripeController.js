@@ -198,6 +198,23 @@ export async function handleWebhook(req, res) {
         }
         break;
 
+      // ── Stripe Custom account verification complete ───────────────────────
+      case 'account.updated': {
+        const acct = event.data.object;
+        if (acct.charges_enabled && acct.details_submitted) {
+          const updated = await TradePro.findOneAndUpdate(
+            { stripeAccountId: acct.id, stripeOnboarded: false },
+            { stripeOnboarded: true },
+            { new: true }
+          );
+          if (updated) {
+            console.log(`\n✅ [Stripe] account.updated — ${acct.id} now verified`);
+            console.log(`   TradePro : ${updated.email} → stripeOnboarded: true`);
+          }
+        }
+        break;
+      }
+
       default:
         // Silently ignore all other event types
         break;

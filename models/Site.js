@@ -40,7 +40,7 @@ const siteSchema = new Schema(
     // GeoJSON point — populated by geocoding the address on create
     location: {
       type:        { type: String, enum: ['Point'], default: 'Point' },
-      coordinates: { type: [Number], default: [0, 0] }, // [lng, lat]
+      coordinates: { type: [Number], default: [0.0, 0.0] }, // [lng, lat] — Double, not Int32
     },
   },
   { timestamps: true }

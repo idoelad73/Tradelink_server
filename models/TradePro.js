@@ -22,7 +22,8 @@ const tradeProSchema = new Schema(
     locationConsent: { type: Boolean, default: false },
     location: {
       type:        { type: String, enum: ['Point'], default: 'Point' },
-      coordinates: { type: [Number], default: [0, 0] },
+      // Use 0.0 literals so MongoDB stores Double (float64), not Int32
+      coordinates: { type: [Number], default: [0.0, 0.0] },
     },
 
     // ── Availability schedule ─────────────────────────────────

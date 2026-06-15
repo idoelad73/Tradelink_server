@@ -79,7 +79,7 @@ export async function createSite(req, res, next) {
     const coords = await geocodeAddress(address);
     const location = {
       type: 'Point',
-      coordinates: coords ? [coords.lng, coords.lat] : [0, 0],
+      coordinates: coords ? [parseFloat(coords.lng), parseFloat(coords.lat)] : [0.0, 0.0],
     };
 
     // Create the site document
@@ -777,7 +777,7 @@ export async function findTrades(req, res, next) {
       lng = coords.lng;
       lat = coords.lat;
       await Site.findByIdAndUpdate(site._id, {
-        location: { type: 'Point', coordinates: [lng, lat] },
+        location: { type: 'Point', coordinates: [parseFloat(lng), parseFloat(lat)] },
       });
     }
 
