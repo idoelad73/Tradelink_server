@@ -6,15 +6,21 @@ function normalizeTrades(raw) {
   const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
   return arr.map((t) =>
     typeof t === 'string'
-      ? { name: t, assigned: false, budgetType: null, maxAmount: null, totalHours: null, requiredDate: null, workers_no: null }
+      ? {
+          name: t, assigned: false,
+          budgetType: null, maxAmount: null, totalHours: null, totalWorkingHrs: null,
+          requiredDate: null, workers_no: null,
+        }
       : {
-          name:         t.name,
-          assigned:     t.assigned     ?? false,
-          budgetType:   t.budgetType   ?? null,
-          maxAmount:    t.maxAmount    ?? null,
-          totalHours:   t.totalHours   ?? null,
-          requiredDate: t.requiredDate ?? null,
-          workers_no:   t.workers_no   ?? t.workersNeeded ?? null, // accept both field names from client
+          name:            t.name,
+          assigned:        t.assigned        ?? false,
+          tradeProId:      t.tradeProId      ?? null,
+          budgetType:      t.budgetType      ?? null,
+          maxAmount:       t.maxAmount       ?? null,
+          totalHours:      t.totalHours      ?? null,
+          totalWorkingHrs: t.totalWorkingHrs ?? null,   // ← was silently dropped before
+          requiredDate:    t.requiredDate    ?? null,
+          workers_no:      t.workers_no      ?? t.workersNeeded ?? null,
         }
   );
 }
@@ -167,12 +173,78 @@ export async function deleteSite(req, res, next) {
   }
 }
 
+// GET /api/contractor/sites/:siteId/workers-left?tradeName=Painter&date=2026-06-22
+// Returns how many worker slots remain for a trade+date on a specific site
+export async function getWorkersLeft(req, res, next) {
+  try {
+    const { siteId } = req.params;
+    const { tradeName, date } = req.query;
+    if (!tradeName || !date)
+      return res.status(400).json({ message: 'tradeName and date are required' });
+
+    const site = await Site.findById(siteId).select('tradesNeeded').lean();
+    if (!site) return res.status(404).json({ message: 'Site not found' });
+
+    const tradeEntry    = site.tradesNeeded?.find((t) => t.name === tradeName);
+    const workersNeeded = tradeEntry?.workers_no ?? 0;
+
+    if (!workersNeeded) {
+      return res.json({ workersNeeded: 0, workersOffered: 0, workersLeft: 0, isFull: false });
+    }
+
+    // Sum only PENDING availability messages for this slot.
+    // Accepted messages are already reflected in the decremented workers_no,
+    // so counting them again would double-subtract their workers.
+    const messages = await Message.find({
+      site:          siteId,
+      tradeName,
+      requestedDate: date,
+      status:        'pending',
+    }).select('workersOffered').lean();
+
+    const totalOffered = messages.reduce((sum, m) => sum + (m.workersOffered || 1), 0);
+    const workersLeft  = Math.max(0, workersNeeded - totalOffered);
+
+    res.json({ workersNeeded, workersOffered: totalOffered, workersLeft, isFull: workersLeft <= 0 });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // POST /api/contractor/trade-pros/:tradeId/ask-availability
 // Sends an availability-request email to the trade professional
 export async function askAvailability(req, res, next) {
   try {
-    const { date, siteName, siteAddress = '', lang = 'en', siteId } = req.body;
+    const { date, siteName, siteAddress = '', lang = 'en', siteId,
+            tradeName = '', workersOffered = 1 } = req.body;
     if (!date) return res.status(400).json({ message: 'date is required' });
+
+    // ── Check worker slots before doing anything else ─────────────────────
+    if (siteId && tradeName) {
+      const site = await Site.findById(siteId).select('tradesNeeded').lean();
+      const tradeEntry    = site?.tradesNeeded?.find((t) => t.name === tradeName);
+      const workersNeeded = tradeEntry?.workers_no ?? 0;
+
+      if (workersNeeded > 0) {
+        // Count ONLY pending messages — accepted ones already decremented workers_no
+        // in the DB (approveAvailabilityRequest does this). Counting them again here
+        // would double-subtract and make available slots appear lower than they are.
+        const existing = await Message.find({
+          site: siteId, tradeName, requestedDate: date, status: 'pending',
+        }).select('workersOffered').lean();
+
+        const totalOffered = existing.reduce((sum, m) => sum + (m.workersOffered || 1), 0);
+        const workersLeft  = workersNeeded - totalOffered;
+
+        if (workersLeft <= 0) {
+          return res.status(409).json({ slotsFull: true, message: 'All worker slots are filled for this trade and date.' });
+        }
+        const requested = parseInt(workersOffered) || 1;
+        if (requested > workersLeft) {
+          return res.status(409).json({ tooMany: true, workersLeft, message: `Only ${workersLeft} slot(s) remaining.` });
+        }
+      }
+    }
 
     const [pro, contractor] = await Promise.all([
       TradePro.findById(req.params.tradeId).select('fullName email professionality photo'),
@@ -283,13 +355,15 @@ export async function askAvailability(req, res, next) {
     // Create message record + increment counter
     if (siteId) {
       await Message.create({
-        tradePro:      req.params.tradeId,
-        site:          siteId,
-        contractor:    req.userId,
-        requestedDate: date,
-        status:        'pending',
-        type:          'availability',
-        senderType:    'contractor',
+        tradePro:       req.params.tradeId,
+        site:           siteId,
+        contractor:     req.userId,
+        requestedDate:  date,
+        tradeName,
+        workersOffered: parseInt(workersOffered) || 1,
+        status:         'pending',
+        type:           'availability',
+        senderType:     'contractor',
       });
     }
     await TradePro.findByIdAndUpdate(req.params.tradeId, {
@@ -531,7 +605,20 @@ export async function getApplications(req, res, next) {
 
     const reschedules = rescheduleRequests.map(m => ({ ...m, _isReschedule: true }));
 
-    res.json({ applications: marked, reschedules });
+    // Pending availability requests sent BY this contractor (awaiting trade pro response)
+    const sentAvailability = await Message.find({
+      contractor: req.userId,
+      type:       'availability',
+      status:     'pending',
+    })
+      .populate('tradePro', 'fullName professionality photo')
+      .populate('site',     'name address')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    const sentRequests = sentAvailability.map(m => ({ ...m, _isSentRequest: true }));
+
+    res.json({ applications: marked, reschedules, sentRequests });
   } catch (err) {
     next(err);
   }
@@ -731,6 +818,149 @@ export async function approveApplication(req, res, next) {
       blockedDate:         finalDate || null,
       blockedApplicationIds: siblingApplicationIds.map(String),
     });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// PATCH /api/contractor/messages/:id/approve-availability
+// Contractor directly approves a sent availability request (books the trade pro without waiting for their response)
+export async function approveAvailabilityRequest(req, res, next) {
+  try {
+    const msg = await Message.findOne({
+      _id:        req.params.id,
+      contractor: req.userId,
+      type:       'availability',
+      status:     'pending',
+    })
+      .populate('tradePro', 'professionality fullName email')
+      .populate('site',     'name address tradesNeeded contractor');
+
+    if (!msg) return res.status(404).json({ message: 'Request not found' });
+    if (String(msg.site.contractor) !== String(req.userId))
+      return res.status(403).json({ message: 'Not authorized' });
+
+    // Block if the trade slot is already assigned to another pro
+    const tradeSlot = msg.site.tradesNeeded?.find(
+      (t) => t.name?.toLowerCase() === msg.tradePro.professionality?.toLowerCase()
+    );
+    if (tradeSlot?.assigned && (tradeSlot.workers_no ?? 1) <= 0) {
+      return res.status(409).json({ alreadyAssigned: true, message: 'Trade already assigned for this job' });
+    }
+
+    const finalDate = msg.requestedDate || null;
+
+    // Calculate remaining workers (and total hrs) after this booking
+    const workersOffered     = msg.workersOffered ?? 1;
+    const currentWorkers     = tradeSlot?.workers_no ?? 0;
+    const newWorkersCount    = Math.max(0, currentWorkers - workersOffered);
+    const totalHours         = tradeSlot?.totalHours ?? null;
+    const newTotalWorkingHrs = (tradeSlot?.budgetType === 'hours' && totalHours)
+      ? totalHours * newWorkersCount
+      : null;
+
+    // 1. Mark this availability message as accepted
+    msg.status = 'accepted';
+    await msg.save();
+
+    // 2. Update trade slot: decrement workers_no; mark assigned when fully filled
+    await Site.updateOne(
+      {
+        _id: msg.site._id,
+        'tradesNeeded.name': { $regex: new RegExp(`^${msg.tradePro.professionality}$`, 'i') },
+      },
+      {
+        $set: {
+          'tradesNeeded.$.assigned':         true,                // always mark as "has someone"
+          'tradesNeeded.$.tradeProId':        msg.tradePro._id,
+          'tradesNeeded.$.workers_no':        newWorkersCount,    // remaining slots after this booking
+          'tradesNeeded.$.totalWorkingHrs':   newTotalWorkingHrs, // totalHours × remaining workers
+        },
+      }
+    );
+
+    // 3. Push booking onto trade pro (as 'booked')
+    //    totalHours = minimum job hours (for clock validation)
+    //    workers_no = how many workers this specific trade pro is bringing
+    if (finalDate) {
+      await TradePro.updateOne(
+        { _id: msg.tradePro._id },
+        { $push: { bookings: {
+          siteId:      msg.site._id,
+          siteName:    msg.site.name,
+          siteAddress: msg.site.address,
+          dates:       [finalDate],
+          status:      'booked',
+          totalHours:  tradeSlot?.totalHours   ?? null,
+          workers_no:  workersOffered,                    // workers THIS trade pro brings
+        }}}
+      );
+    }
+
+    // 4. Create in-app approval message for the trade pro
+    await Message.create({
+      tradePro:      msg.tradePro._id,
+      site:          msg.site._id,
+      contractor:    req.userId,
+      requestedDate: finalDate || '',
+      status:        'approved',
+      type:          'approval',
+      senderType:    'contractor',
+    });
+    await TradePro.findByIdAndUpdate(msg.tradePro._id, { $inc: { availabilityMessages: 1 } });
+
+    // 5. Send approval email to the trade pro
+    const contractor = await Contractor.findById(req.userId).select('companyName');
+    const companyName = contractor?.companyName || 'Your contractor';
+
+    if (msg.tradePro.email) {
+      const displayDate = finalDate
+        ? new Date(finalDate + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+        : null;
+
+      const subject = `🎉 Your availability for "${msg.site.name}" was approved — TradeLink`;
+      const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${subject}</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
+</head><body>
+<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
+  <div style="background:linear-gradient(135deg,#22c55e,#0ea5e9);padding:28px;text-align:center">
+    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
+    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">Availability Approved</p>
+  </div>
+  <div style="padding:32px">
+    <div style="font-size:48px;text-align:center;margin-bottom:16px">🎉</div>
+    <h2 style="color:#0f172a;font-size:20px;font-weight:800;text-align:center;margin-bottom:8px">You're booked, ${msg.tradePro.fullName}!</h2>
+    <p style="color:#475569;font-size:14px;line-height:1.7;text-align:center;margin-bottom:28px">
+      <strong>${companyName}</strong> has confirmed your availability for the project below.
+    </p>
+    <div style="background:#f0fdf4;border:2px solid #86efac;border-radius:14px;padding:20px;margin-bottom:24px">
+      <p style="color:#166534;font-size:16px;font-weight:800;margin-bottom:4px">🏗️ ${msg.site.name}</p>
+      <p style="color:#64748b;font-size:13px;margin-bottom:${displayDate ? '12px' : '0'}">📍 ${msg.site.address}</p>
+      ${displayDate ? `<div style="background:#fff;border:1.5px solid #86efac;border-radius:10px;padding:12px;text-align:center;margin-top:4px">
+        <p style="color:#166534;font-size:15px;font-weight:800">📅 ${displayDate}</p>
+      </div>` : ''}
+    </div>
+    <div style="background:#fefce8;border:1.5px solid #fde68a;border-radius:12px;padding:14px;margin-bottom:28px;text-align:center">
+      <p style="color:#92400e;font-size:13px;font-weight:700">✅ Confirmed by ${companyName}</p>
+      <p style="color:#78350f;font-size:12px;margin-top:4px">Log in to TradeLink to view the full details and your schedule.</p>
+    </div>
+    <p style="color:#94a3b8;font-size:12px;text-align:center;line-height:1.6">
+      This notification was sent through TradeLink. Please do not reply to this automated email.
+    </p>
+  </div>
+  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
+    <p style="color:#94a3b8;font-size:11px">TradeLink · Connecting trade professionals with projects</p>
+  </div>
+</div>
+</body></html>`;
+
+      await sendMail({ to: msg.tradePro.email, subject, html });
+      console.log(`[approveAvailabilityRequest] Approval email sent to ${msg.tradePro.email}`);
+    }
+
+    res.json({ ok: true });
   } catch (err) {
     next(err);
   }

@@ -21,6 +21,8 @@ const messageSchema = new Schema(
     contractor:    { type: Schema.Types.ObjectId, ref: 'Contractor', required: true },
     requestedDate: { type: String, default: '' },   // YYYY-MM-DD
     text:          { type: String, default: '' },
+    tradeName:      { type: String,  default: '' }, // e.g. 'Painter' — which trade slot this fills
+    workersOffered: { type: Number,  default: 1  }, // how many workers this TradePro is offering
 
     status: {
       type:    String,

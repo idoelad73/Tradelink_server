@@ -20,11 +20,13 @@ const siteSchema = new Schema(
       name:       { type: String, required: true, trim: true },
       assigned:   { type: Boolean, default: false },
       tradeProId: { type: Schema.Types.ObjectId, ref: 'TradePro', default: null },
-      budgetType:   { type: String, enum: ['amount', 'hours'], default: null },
-      maxAmount:    { type: Number, default: null },
-      totalHours:   { type: Number, default: null },
-      requiredDate: { type: String, default: null }, // YYYY-MM-DD
-      workers_no:   { type: Number, default: null }, // number of workers needed
+      budgetType:      { type: String, enum: ['amount', 'hours'], default: null },
+      maxAmount:       { type: Number, default: null },
+      totalHours:      { type: Number, default: null },
+      // totalWorkingHrs = totalHours × workers_no (hours-budget only)
+      totalWorkingHrs: { type: Number, default: null },
+      requiredDate:    { type: String, default: null }, // YYYY-MM-DD
+      workers_no:      { type: Number, default: null }, // number of workers needed
     }],
 
     photo:  { type: String, default: null }, // Cloudinary URL

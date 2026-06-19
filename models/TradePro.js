@@ -37,6 +37,9 @@ const tradeProSchema = new Schema(
       siteAddress: { type: String, default: '' },
       dates:       [{ type: String }],   // YYYY-MM-DD for every working day in range
       status:      { type: String, enum: ['order', 'booked'], default: 'booked' },
+      // Job requirements stored at booking time so the working-hours modal can enforce them
+      totalHours:  { type: Number, default: null }, // minimum hours required for this job
+      workers_no:  { type: Number, default: null }, // workers this trade pro is bringing
     }],
 
     // ── Stripe Connect — store only Stripe IDs, never card data ─
@@ -59,6 +62,40 @@ tradeProSchema.pre('save', async function (next) {
   if (!this.isModified('password')) return next();
   this.password = await bcrypt.hash(this.password, 12);
   next();
+});
+
+// ── Auto-fix coordinate BSON types to Double after every save ─────────────────
+// Mongoose schema casting calls .valueOf() on BSON Double objects, stripping the
+// type hint and letting the driver store whole numbers as Int32.
+// This post-save hook writes coordinates back via the raw collection API so they
+// are always stored as Float64 (Double) — required for 2dsphere geo-queries.
+//
+// [0, 0] special case: MongoDB's numeric-equality no-op check treats Int32(0)
+// and Double(0.0) as the same value. We use a two-step sentinel write to force
+// the BSON type change.
+tradeProSchema.post('save', async function () {
+  try {
+    const { Double } = mongoose.mongo;
+    const col = this.constructor.collection;
+    const [lng, lat] = this.location?.coordinates ?? [0, 0];
+
+    if (lng === 0 && lat === 0) {
+      // Two-step: value must change for MongoDB to write → sentinel → back to 0.0 Double
+      await col.updateOne({ _id: this._id }, {
+        $set: { 'location.coordinates': [new Double(0.1), new Double(0.1)] },
+      });
+      await col.updateOne({ _id: this._id }, {
+        $set: { 'location.coordinates': [new Double(0), new Double(0)] },
+      });
+    } else {
+      // Non-zero: direct write — raw API bypasses Mongoose casting
+      await col.updateOne({ _id: this._id }, {
+        $set: { 'location.coordinates': [new Double(lng), new Double(lat)] },
+      });
+    }
+  } catch {
+    // Non-fatal — geo queries still work with Int32 for non-zero coords
+  }
 });
 
 tradeProSchema.methods.comparePassword = function (plaintext) {

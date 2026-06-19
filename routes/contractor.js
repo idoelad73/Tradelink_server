@@ -4,8 +4,8 @@ import { protect, restrictTo } from '../middleware/auth.js';
 import {
   getMe, updateMe,
   createSite, getSites, getSite, updateSite, deleteSite, findTrades,
-  getTradeBusyDays, askAvailability,
-  getApplications, approveApplication,
+  getTradeBusyDays, askAvailability, getWorkersLeft,
+  getApplications, approveApplication, approveAvailabilityRequest,
   getNotifications, markNotificationsRead,
   getWorkPlan, updateWorkPlanDate, deleteWorkPlanTrade, requestWorkPlanDate,
   approveReschedule, declineReschedule,
@@ -34,6 +34,7 @@ router.get('/applications',                        getApplications);
 router.patch('/applications/:id/approve',          approveApplication);
 router.patch('/messages/:id/approve-reschedule',   approveReschedule);
 router.patch('/messages/:id/decline-reschedule',   declineReschedule);
+router.patch('/messages/:id/approve-availability', approveAvailabilityRequest);
 
 // Availability-approved notifications
 router.get('/notifications',       getNotifications);
@@ -49,6 +50,7 @@ router.post('/sites',       upload.single('photo'), createSite);
 router.get('/sites',        getSites);
 router.get('/trade-pros/:tradeId/busy-days',         getTradeBusyDays);
 router.post('/trade-pros/:tradeId/ask-availability', askAvailability);
+router.get('/sites/:siteId/workers-left',            getWorkersLeft);
 router.get('/sites/:id',              getSite);
 router.get('/sites/:id/work-plan',            getWorkPlan);
 router.post('/sites/:id/work-plan/request-date', requestWorkPlanDate);

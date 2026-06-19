@@ -1,8 +1,12 @@
 import jwt from 'jsonwebtoken';
+import mongoose from 'mongoose';
 import TradePro from '../models/TradePro.js';
 import Contractor from '../models/Contractor.js';
 import { uploadPhoto, uploadDocument } from '../utils/cloudinary.js';
 import stripe from '../utils/stripe.js';
+
+// Force BSON Double so MongoDB stores as Float64, not Int32
+const toDouble = (v) => new mongoose.mongo.Double(parseFloat(v));
 
 const signToken = (id, type) =>
   jwt.sign({ id, type }, process.env.JWT_SECRET, {
@@ -231,11 +235,27 @@ export async function registerTrade(req, res, next) {
       locationConsent: consent,
       location: {
         type: 'Point',
-        coordinates: hasCoords ? [parseFloat(lng), parseFloat(lat)] : [0.0, 0.0],
+        // Mongoose schema casting will strip the BSON Double wrapper via .valueOf(),
+        // so coordinates are stored as Int32 here. We fix them below with a raw update.
+        coordinates: hasCoords ? [parseFloat(lng), parseFloat(lat)] : [0, 0],
       },
       stripeAccountId,
       stripeOnboarded,
     });
+
+    // Post-create: force coordinate BSON type to Double using raw collection API.
+    // Bypass Mongoose schema casting which strips the Double wrapper.
+    // Note: MongoDB numeric equality means [0,0] Int32 → [0.0,0.0] Double is a no-op —
+    // those are placeholder coords anyway and don't affect 2dsphere queries.
+    if (hasCoords) {
+      const { Double } = mongoose.mongo;
+      await TradePro.collection.updateOne(
+        { _id: user._id },
+        { $set: {
+          'location.coordinates': [new Double(parseFloat(lng)), new Double(parseFloat(lat))],
+        }}
+      );
+    }
 
     sendToken(user, 'trade', 201, res);
   } catch (err) {

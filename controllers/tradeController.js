@@ -1,3 +1,4 @@
+import mongoose from 'mongoose';
 import TradePro from '../models/TradePro.js';
 import Contractor from '../models/Contractor.js';
 import Message from '../models/Message.js';
@@ -7,6 +8,9 @@ import jwt from 'jsonwebtoken';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
 import { sendMail } from '../utils/mailer.js';
+
+// Force BSON Double so MongoDB stores as Float64, not Int32
+const toDouble = (v) => new mongoose.mongo.Double(parseFloat(v));
 
 // ── Working-day helpers (mirrors client-side logic) ───────────────────────────
 const _hCache = {};
@@ -67,13 +71,14 @@ export async function getMe(req, res, next) {
 // PATCH /api/trade/me
 export async function updateMe(req, res, next) {
   try {
-    const { fullName, phone, address, professionality, hourlyRate } = req.body;
+    const { fullName, phone, address, professionality, hourlyRate, locationConsent } = req.body;
     const updates = {};
     if (fullName        !== undefined) updates.fullName        = fullName;
     if (phone           !== undefined) updates.phone           = phone;
     if (address         !== undefined) updates.address         = address;
     if (professionality !== undefined) updates.professionality = professionality;
     if (hourlyRate      !== undefined) updates.hourlyRate      = hourlyRate ? parseFloat(hourlyRate) : null;
+    if (locationConsent !== undefined) updates.locationConsent = locationConsent === true || locationConsent === 'true';
 
     if (req.file) {
       const result = await uploadPhoto(req.file.buffer, 'tradelink/profiles');
@@ -176,9 +181,17 @@ export async function updateLocation(req, res, next) {
     if (lat === undefined || lng === undefined)
       return res.status(400).json({ message: 'lat and lng are required' });
 
-    await TradePro.findByIdAndUpdate(req.userId, {
-      location: { type: 'Point', coordinates: [parseFloat(lng), parseFloat(lat)] },
-    });
+    // Use raw collection API to bypass Mongoose schema casting.
+    // Mongoose's Number caster calls .valueOf() on BSON Double objects,
+    // converting them back to plain JS numbers which the driver stores as Int32.
+    const { Double } = mongoose.mongo;
+    await TradePro.collection.updateOne(
+      { _id: new mongoose.Types.ObjectId(req.userId) },
+      { $set: {
+        'location.type': 'Point',
+        'location.coordinates': [new Double(parseFloat(lng)), new Double(parseFloat(lat))],
+      }}
+    );
 
     console.log(`[updateLocation] ${req.userId} → lat=${lat}, lng=${lng}`);
     res.json({ message: 'Location updated' });
@@ -373,16 +386,21 @@ export async function findJobs(req, res, next) {
     await Promise.all(ungeocoded.map(async (s) => {
       const coords = await geocodeAddress(s.address).catch(() => null);
       if (coords) {
-        await Site.findByIdAndUpdate(s._id, {
-          location: { type: 'Point', coordinates: [coords.lng, coords.lat] },
-        });
+        const { Double } = mongoose.mongo;
+        await Site.collection.updateOne(
+          { _id: s._id },
+          { $set: {
+            'location.type': 'Point',
+            'location.coordinates': [new Double(parseFloat(coords.lng)), new Double(parseFloat(coords.lat))],
+          }}
+        );
       }
     }));
 
     const pipeline = [
       {
         $geoNear: {
-          near:          { type: 'Point', coordinates: [lng, lat] },
+          near:          { type: 'Point', coordinates: [toDouble(lng), toDouble(lat)] },
           distanceField: 'distanceMeters',
           maxDistance:   meters,
           query: {
@@ -626,7 +644,7 @@ export async function checkWorkLog(req, res, next) {
 // as a clean approved-only billing ledger.
 export async function submitWorkLog(req, res, next) {
   try {
-    const { siteId, date, totalSeconds } = req.body;
+    const { siteId, date, totalSeconds, workers_no } = req.body;
 
     if (!siteId || !date || totalSeconds == null) {
       return res.status(400).json({ message: 'siteId, date and totalSeconds are required' });
@@ -646,9 +664,13 @@ export async function submitWorkLog(req, res, next) {
     if (!site) return res.status(404).json({ message: 'Site not found' });
     if (!pro)  return res.status(404).json({ message: 'Trade pro not found' });
 
-    const actual_hours = parseFloat((totalSec / 3600).toFixed(2));
-    const hourly_rate  = pro.hourlyRate ?? null;
-    const order_sum    = parseFloat(((actual_hours) * (hourly_rate ?? 0)).toFixed(2));
+    const actual_hours  = parseFloat((totalSec / 3600).toFixed(2));
+    const hourly_rate   = pro.hourlyRate ?? null;
+    const workers_count = (Number.isFinite(Number(workers_no)) && Number(workers_no) > 0)
+      ? Number(workers_no)
+      : 1;
+    // order_sum = hours × rate × workers (covers the full team cost)
+    const order_sum = parseFloat((actual_hours * (hourly_rate ?? 0) * workers_count).toFixed(2));
 
     // Store as a pending payment message — contractor will approve/reject from their dashboard.
     // The snapshot (hours / rate / sum) is JSON-encoded in the text field so the
@@ -658,7 +680,7 @@ export async function submitWorkLog(req, res, next) {
       site:          siteId,
       contractor:    site.contractor,
       requestedDate: date,
-      text:          JSON.stringify({ actual_hours, hourly_rate, order_sum }),
+      text:          JSON.stringify({ actual_hours, hourly_rate, workers_no: workers_count, order_sum }),
       status:        'pending',
       type:          'payment',
       senderType:    'trade',
