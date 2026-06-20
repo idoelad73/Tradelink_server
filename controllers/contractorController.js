@@ -1,5 +1,6 @@
 import Contractor from '../models/Contractor.js';
 import Site from '../models/Site.js';
+import TradeGrade, { GRADE_NAMES_MAP } from '../models/TradeGrade.js';
 
 // Normalises incoming tradesNeeded — accepts string array OR {name,assigned} object array
 function normalizeTrades(raw) {
@@ -1009,8 +1010,9 @@ export async function findTrades(req, res, next) {
       return res.status(404).json({ message: 'Site not found' });
     }
 
-    const { trade, distance = '25', unit = 'mi', maxRate } = req.query;
+    const { trade, distance = '25', unit = 'mi', maxRate, minRating } = req.query;
     if (!trade) return res.status(400).json({ message: 'trade query param is required' });
+    const minGrade = minRating ? parseInt(minRating, 10) : 0;
 
     // Pull the requiredDate for this trade from the site
     const tradeEntry  = site.tradesNeeded.find((t) => t.name === trade);
@@ -1073,6 +1075,13 @@ export async function findTrades(req, res, next) {
       });
     }
 
+    // Optional minimum grade filter — only include trades with avgGrade >= minGrade
+    if (minGrade > 0) {
+      pipeline.push({
+        $match: { avgGrade: { $gte: minGrade } },
+      });
+    }
+
     // ── HARD FILTER: exclude trades already booked on the requiredDate ────────
     // A trade is "booked" when an approval pushed their date into bookings[].dates.
     // Also exclude trades who manually marked that day as busy (busyDays).
@@ -1097,7 +1106,11 @@ export async function findTrades(req, res, next) {
           },
         },
       },
-      { $sort: { isAvailableOnDate: -1, hourlyRate: 1 } },
+      // When a min grade is set: sort by avgGrade desc first, then availability
+      // Otherwise: keep availability-first, then hourlyRate
+      minGrade > 0
+        ? { $sort: { avgGrade: -1, isAvailableOnDate: -1, hourlyRate: 1 } }
+        : { $sort: { isAvailableOnDate: -1, hourlyRate: 1 } },
       {
         $project: {
           fullName:        1,
@@ -1106,6 +1119,8 @@ export async function findTrades(req, res, next) {
           professionality: 1,
           photo:           1,
           hourlyRate:      1,
+          avgGrade:        1,
+          gradeCount:      1,
           busyDays:        1,
           bookings:        1,
           distance:        1,
@@ -1306,6 +1321,85 @@ export async function updatePaymentApproval(req, res, next) {
 
     res.json({ deleted: true, _id: orderId, order: populated });
   } catch (err) {
+    next(err);
+  }
+}
+
+// ── GET /contractor/trade-grades/eligible ────────────────────────────────────
+// Returns every approved order for this contractor that hasn't been graded yet.
+// Each order is independently gradable — same trade on the same site can appear
+// multiple times if they completed multiple orders.
+export async function getGradableTrades(req, res, next) {
+  try {
+    const contractorId = req.userId;
+
+    // All approved orders for this contractor (each row = one gradable opportunity)
+    const orders = await WorkHoursOrder.find({ contractor_id: contractorId, status: 'approved' })
+      .populate('trade_id', 'fullName professionality photo')
+      .populate('site_id',  'name')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (!orders.length) return res.json({ trades: [] });
+
+    // Only keep orders where both trade and site are still populated
+    const valid = orders.filter(o => o.trade_id && o.site_id);
+
+    // Remove orders that have already been graded (keyed by order_id)
+    const existing = await TradeGrade.find({ contractor_id: contractorId }).select('order_id').lean();
+    const gradedOrderIds = new Set(existing.map(g => String(g.order_id)));
+
+    const gradable = valid
+      .filter(o => !gradedOrderIds.has(String(o._id)))
+      .map(o => ({
+        order_id:        o._id,
+        order_date:      o.date,          // YYYY-MM-DD string for display
+        trade_id:        o.trade_id._id,
+        trade_name:      o.trade_id.fullName,
+        professionality: o.trade_id.professionality,
+        photo:           o.trade_id.photo || null,
+        site_id:         o.site_id._id,
+        site_name:       o.site_id.name,
+      }));
+
+    res.json({ trades: gradable });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /contractor/trade-grades ────────────────────────────────────────────
+// Submit a grade (1–5) for a specific trade + site.
+export async function submitTradeGrade(req, res, next) {
+  try {
+    const { trade_id, site_id, order_id, trade_grade } = req.body;
+    const grade = parseInt(trade_grade, 10);
+    if (!trade_id || !order_id || isNaN(grade) || grade < 1 || grade > 5) {
+      return res.status(400).json({ message: 'trade_id, order_id and trade_grade (1–5) are required.' });
+    }
+
+    const doc = await TradeGrade.findOneAndUpdate(
+      { contractor_id: req.userId, order_id },
+      { trade_id, site_id: site_id || null, order_id, trade_grade: grade, grade_name: GRADE_NAMES_MAP[grade], date: new Date() },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    // Recalculate average and count for this trade across ALL contractors/sites
+    const [agg] = await TradeGrade.aggregate([
+      { $match: { trade_id: doc.trade_id } },
+      { $group: { _id: '$trade_id', avg: { $avg: '$trade_grade' }, count: { $sum: 1 } } },
+    ]);
+
+    if (agg) {
+      await TradePro.findByIdAndUpdate(trade_id, {
+        avgGrade:   Math.round(agg.avg * 10) / 10,  // 1 decimal place, e.g. 4.3
+        gradeCount: agg.count,
+      });
+    }
+
+    res.status(201).json({ grade: doc, avgGrade: agg?.avg ?? grade, gradeCount: agg?.count ?? 1 });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ message: 'Already graded.' });
     next(err);
   }
 }

@@ -10,6 +10,7 @@ import {
   getWorkPlan, updateWorkPlanDate, deleteWorkPlanTrade, requestWorkPlanDate,
   approveReschedule, declineReschedule,
   getPaymentApprovalsCount, getPaymentApprovals, updatePaymentApproval,
+  getGradableTrades, submitTradeGrade,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -44,6 +45,10 @@ router.patch('/notifications/read', markNotificationsRead);
 router.get('/payment-approvals/count',       getPaymentApprovalsCount);
 router.get('/payment-approvals',             getPaymentApprovals);
 router.patch('/payment-approvals/:orderId',  updatePaymentApproval);
+
+// Trade grading
+router.get('/trade-grades/eligible', getGradableTrades);
+router.post('/trade-grades',         submitTradeGrade);
 
 // Sites — full CRUD
 router.post('/sites',       upload.single('photo'), createSite);

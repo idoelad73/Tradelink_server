@@ -42,6 +42,10 @@ const tradeProSchema = new Schema(
       workers_no:  { type: Number, default: null }, // workers this trade pro is bringing
     }],
 
+    // ── Trade grades — denormalized averages updated on every new grade ──────────
+    avgGrade:   { type: Number, default: null },  // 1.0 – 5.0, null = no grades yet
+    gradeCount: { type: Number, default: 0    },  // total number of grades received
+
     // ── Stripe Connect — store only Stripe IDs, never card data ─
     stripeAccountId: { type: String,  default: null  }, // Express connected account
     stripeOnboarded: { type: Boolean, default: false }, // true after charges_enabled
