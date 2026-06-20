@@ -46,8 +46,12 @@ const workHoursOrderSchema = new Schema(
       type:    Number,    // TradePro.hourlyRate at the time this record was last enriched
       default: null,
     },
+    workers_no: {
+      type:    Number,    // number of workers the trade pro brought (from booking)
+      default: 1,
+    },
     order_sum: {
-      type:    Number,    // actual_hours × hourly_rate — set by controller, not a hook
+      type:    Number,    // actual_hours × hourly_rate × workers_no — set by controller
       default: 0,
     },
     status: {
@@ -79,10 +83,12 @@ workHoursOrderSchema.index({ trade_id: 1,     createdAt: -1 });
  * Recalculates order_sum every time a document is created or saved.
  */
 workHoursOrderSchema.pre('save', function (next) {
-  const hours = this.actual_hours;
-  const rate  = this.hourly_rate;
+  const hours   = this.actual_hours;
+  const rate    = this.hourly_rate;
+  const workers = this.workers_no || 1;
   if (hours != null && rate != null) {
-    this.order_sum = parseFloat((hours * rate).toFixed(2));
+    // Full team cost: hours × rate × workers
+    this.order_sum = parseFloat((hours * rate * workers).toFixed(2));
   } else {
     this.order_sum = 0;
   }

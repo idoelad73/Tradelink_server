@@ -719,13 +719,31 @@ export async function approveApplication(req, res, next) {
 
     const finalDate = app.requestedDate || scheduledDate || null;
 
-    // Mark the matching trade as assigned + store the trade pro's ID
+    // ── Decrement workers_no (same logic as approveAvailabilityRequest) ────────
+    const workersOffered     = app.workersOffered ?? 1;
+    const currentWorkers     = tradeSlot?.workers_no ?? 0;
+    const newWorkersCount    = Math.max(0, currentWorkers - workersOffered);
+    const totalHours         = tradeSlot?.totalHours ?? null;
+    const newTotalWorkingHrs = (tradeSlot?.budgetType === 'hours' && totalHours)
+      ? totalHours * newWorkersCount
+      : null;
+
+    const siteUpdate = {
+      'tradesNeeded.$.tradeProId':  app.tradePro._id,
+      'tradesNeeded.$.workers_no':  newWorkersCount,
+      'tradesNeeded.$.assigned':    newWorkersCount <= 0,  // fully filled when no slots left
+    };
+    if (newTotalWorkingHrs !== null) {
+      siteUpdate['tradesNeeded.$.totalWorkingHrs'] = newTotalWorkingHrs;
+    }
+
+    // Mark the matching trade slot + decrement remaining worker slots
     await Site.updateOne(
       {
         _id: app.site._id,
         'tradesNeeded.name': { $regex: new RegExp(`^${app.tradePro.professionality}$`, 'i') },
       },
-      { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': app.tradePro._id } }
+      { $set: siteUpdate }
     );
 
     // Upgrade the 'order' booking to 'booked' (turns calendar from orange → dark red)
@@ -740,13 +758,15 @@ export async function approveApplication(req, res, next) {
 
     // Create in-app approval message for the trade pro
     await Message.create({
-      tradePro:      app.tradePro._id,
-      site:          app.site._id,
-      contractor:    req.userId,
-      requestedDate: finalDate || '',
-      status:        'approved',
-      type:          'approval',
-      senderType:    'contractor',
+      tradePro:       app.tradePro._id,
+      site:           app.site._id,
+      contractor:     req.userId,
+      requestedDate:  finalDate || '',
+      tradeName:      app.tradePro.professionality || '',
+      workersOffered: app.workersOffered ?? 1,   // ← carry through from the application
+      status:         'approved',
+      type:           'approval',
+      senderType:     'contractor',
     });
     await TradePro.findByIdAndUpdate(app.tradePro._id, { $inc: { availabilityMessages: 1 } });
 
@@ -1148,23 +1168,41 @@ export async function getPaymentApprovals(req, res, next) {
   try {
     const msgs = await Message.find({ contractor: req.userId, type: 'payment', status: 'pending' })
       .populate('tradePro', 'fullName professionality photo hourlyRate')
-      .populate('site',     'name address')
+      .populate('site',     'name address tradesNeeded')   // ← include tradesNeeded for min hours
       .sort({ createdAt: -1 })
       .lean();
 
     const orders = msgs.map((m) => {
       const snap = (() => { try { return JSON.parse(m.text || '{}'); } catch { return {}; } })();
-      // Use live rate from TradePro if available, fall back to snapshot
-      const liveRate = m.tradePro?.hourlyRate ?? snap.hourly_rate ?? null;
-      const actual   = snap.actual_hours ?? 0;
+
+      const liveRate  = m.tradePro?.hourlyRate ?? snap.hourly_rate ?? null;
+      const actual    = snap.actual_hours ?? 0;
+      const workersNo = snap.workers_no   ?? 1;
+
+      // ── Enforce minimum hours from site's tradesNeeded ──────────────────────
+      const professionality = m.tradePro?.professionality;
+      const siteEntry = professionality
+        ? m.site?.tradesNeeded?.find(t => t.name?.toLowerCase() === professionality.toLowerCase())
+        : null;
+      const minHours    = (siteEntry?.budgetType === 'hours' && siteEntry?.totalHours > 0)
+        ? siteEntry.totalHours : 0;
+      // Use what the trade pro submitted in their work log (snap.workers_no), NOT the site's
+      // remaining slots (siteEntry.workers_no) which drops to 0 after everyone is approved.
+      const effectiveWorkers = workersNo;  // snap.workers_no ?? 1
+      const effective        = minHours > 0 ? Math.max(actual, minHours) : actual;
+      const orderSum         = liveRate ? parseFloat((effective * liveRate * effectiveWorkers).toFixed(2)) : 0;
+
       return {
-        _id:          m._id,           // this IS the message _id — used in updatePaymentApproval
+        _id:          m._id,
         trade_id:     m.tradePro,
-        site_id:      m.site,
+        site_id:      { _id: m.site?._id, name: m.site?.name, address: m.site?.address },
         date:         m.requestedDate,
-        actual_hours: actual,
+        actual_hours: effective,         // min-enforced billing hours
+        submitted_hours: actual,         // what the trade pro actually submitted
+        min_hours:    minHours,          // minimum from site (0 if not set)
         hourly_rate:  liveRate,
-        order_sum:    liveRate ? parseFloat((actual * liveRate).toFixed(2)) : 0,
+        workers_no:   effectiveWorkers,  // workers the trade pro submitted in work log
+        order_sum:    orderSum,
         status:       'pending',
         createdAt:    m.createdAt,
       };
@@ -1193,17 +1231,29 @@ export async function updatePaymentApproval(req, res, next) {
     // The "order" is actually a pending payment message
     const pendingMsg = await Message.findOne({ _id: orderId, contractor: req.userId, type: 'payment', status: 'pending' })
       .populate('tradePro', 'fullName professionality photo hourlyRate')
-      .populate('site',     'name address')
+      .populate('site',     'name address tradesNeeded')   // ← tradesNeeded for min hours
       .lean();
 
     if (!pendingMsg) return res.status(404).json({ message: 'Pending request not found' });
 
     const snap = (() => { try { return JSON.parse(pendingMsg.text || '{}'); } catch { return {}; } })();
-    const liveRate   = pendingMsg.tradePro?.hourlyRate ?? snap.hourly_rate ?? null;
-    const actual     = snap.actual_hours ?? 0;
-    const lockedSum  = liveRate ? parseFloat((actual * liveRate).toFixed(2)) : 0;
-    const tradeId    = pendingMsg.tradePro._id ?? pendingMsg.tradePro;
-    const siteId     = pendingMsg.site?._id    ?? pendingMsg.site ?? null;
+    const liveRate = pendingMsg.tradePro?.hourlyRate ?? snap.hourly_rate ?? null;
+    const actual   = snap.actual_hours ?? 0;
+
+    // ── Enforce minimum hours + site workers from tradesNeeded ───────────────
+    const professionality = pendingMsg.tradePro?.professionality;
+    const siteEntry = professionality
+      ? pendingMsg.site?.tradesNeeded?.find(t => t.name?.toLowerCase() === professionality.toLowerCase())
+      : null;
+    const minHours    = (siteEntry?.budgetType === 'hours' && siteEntry?.totalHours > 0)
+      ? siteEntry.totalHours : 0;
+    // Use snap.workers_no (submitted in work log) — NOT siteEntry.workers_no (remaining slots)
+    const effectiveWorkers = snap.workers_no ?? 1;
+    const effective        = minHours > 0 ? Math.max(actual, minHours) : actual;
+    const lockedSum        = liveRate ? parseFloat((effective * liveRate * effectiveWorkers).toFixed(2)) : 0;
+
+    const tradeId = pendingMsg.tradePro._id ?? pendingMsg.tradePro;
+    const siteId  = pendingMsg.site?._id    ?? pendingMsg.site ?? null;
 
     // ── REJECTION ────────────────────────────────────────────────────────────
     if (status === 'rejected') {
@@ -1213,7 +1263,7 @@ export async function updatePaymentApproval(req, res, next) {
           site:          siteId,
           contractor:    req.userId,
           requestedDate: pendingMsg.requestedDate,
-          text:       JSON.stringify({ actual_hours: actual, hourly_rate: liveRate, order_sum: lockedSum }),
+          text:       JSON.stringify({ actual_hours: effective, hourly_rate: liveRate, workers_no: effectiveWorkers, order_sum: lockedSum }),
           status:     'rejected',
           type:       'payment',
           senderType: 'contractor',
@@ -1231,8 +1281,9 @@ export async function updatePaymentApproval(req, res, next) {
         trade_id:      tradeId,
         site_id:       siteId,
         date:          pendingMsg.requestedDate,
-        actual_hours:  actual,
+        actual_hours:  effective,     // min-enforced hours
         hourly_rate:   liveRate,
+        workers_no:    effectiveWorkers,  // workers submitted in work log
         order_sum:     lockedSum,
         status:        'approved',
       }),

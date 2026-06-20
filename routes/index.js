@@ -18,6 +18,21 @@ router.use('/stripe',     stripeRoutes);
 
 router.get('/health', (_req, res) => res.json({ status: 'ok' }));
 
+// Public — US address autocomplete proxy (Photon/OpenStreetMap)
+// Avoids browser CSP issues by fetching server-side.
+router.get('/address/autocomplete', async (req, res) => {
+  const q = (req.query.q || '').trim();
+  if (!q || q.length < 2) return res.json({ features: [] });
+  try {
+    const url = `https://photon.komoot.io/api/?q=${encodeURIComponent(q)}&countrycode=us&limit=6&lang=en`;
+    const response = await fetch(url);
+    const data     = await response.json();
+    res.json(data);
+  } catch {
+    res.json({ features: [] });
+  }
+});
+
 // Public — returns all trade professionals for the contractor showcase
 router.get('/tradepros', async (_req, res, next) => {
   try {

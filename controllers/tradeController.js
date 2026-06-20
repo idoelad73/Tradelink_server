@@ -62,7 +62,65 @@ export async function getMe(req, res, next) {
       TradePro.findById(req.userId),
       Message.countDocuments({ tradePro: req.userId, type: { $in: ['availability', 'approval'] } }),
     ]);
-    res.json({ trade: { ...trade.toObject(), availabilityMessages: messageCount } });
+
+    const tradeObj = trade.toObject();
+
+    // ── Enrich bookings with totalHours + workers_no from site + message ──────
+    // TradePro.bookings only stores siteId/siteName/dates/status.
+    // WorkingHoursModal needs:
+    //   • totalHours  — minimum hours guard (from site tradesNeeded)
+    //   • workers_no  — workers THIS trade pro is bringing (from accepted application msg)
+    if (tradeObj.bookings?.length && tradeObj.professionality) {
+      const siteIds = [...new Set(
+        tradeObj.bookings.filter(b => b.siteId).map(b => String(b.siteId))
+      )];
+
+      if (siteIds.length > 0) {
+        // 1. Fetch totalHours from site tradesNeeded
+        const [sites, acceptedMsgs] = await Promise.all([
+          Site.find(
+            { _id: { $in: siteIds } },
+            { 'tradesNeeded.name': 1, 'tradesNeeded.totalHours': 1, 'tradesNeeded.budgetType': 1 }
+          ).lean(),
+          // 2. Fetch workersOffered from the trade pro's accepted application for each site
+          Message.find({
+            tradePro: req.userId,
+            site:     { $in: siteIds },
+            type:     'application',
+            status:   'accepted',
+          }).select('site workersOffered').lean(),
+        ]);
+
+        const siteMap = {};
+        for (const site of sites) {
+          const entry = site.tradesNeeded?.find(
+            t => t.name?.toLowerCase() === tradeObj.professionality.toLowerCase()
+          );
+          if (entry) {
+            siteMap[String(site._id)] = {
+              totalHours: entry.totalHours ?? null,
+              budgetType: entry.budgetType ?? null,
+            };
+          }
+        }
+
+        // workers_no = what this trade pro offered (from their accepted application)
+        const workersBySite = {};
+        for (const msg of acceptedMsgs) {
+          workersBySite[String(msg.site)] = msg.workersOffered ?? 1;
+        }
+
+        tradeObj.bookings = tradeObj.bookings.map(b => {
+          const siteInfo = siteMap[String(b.siteId)];
+          const workers  = workersBySite[String(b.siteId)] ?? 1;
+          return siteInfo
+            ? { ...b, totalHours: siteInfo.totalHours, budgetType: siteInfo.budgetType, workers_no: workers }
+            : b;
+        });
+      }
+    }
+
+    res.json({ trade: { ...tradeObj, availabilityMessages: messageCount } });
   } catch (err) {
     next(err);
   }
@@ -477,7 +535,7 @@ export async function findJobs(req, res, next) {
 export async function applyToJob(req, res, next) {
   try {
     const { siteId } = req.params;
-    const { lang = 'en', date } = req.body;
+    const { lang = 'en', date, workers_no } = req.body;
 
     const [pro, site] = await Promise.all([
       TradePro.findById(req.userId).select('fullName professionality photo hourlyRate email'),
@@ -494,11 +552,43 @@ export async function applyToJob(req, res, next) {
       return res.status(409).json({ assigned: true, siteName: site.name });
     }
 
+    // ── Validate worker slots (same logic as askAvailability) ─────────────────
+    const workersNeeded  = tradeEntry.workers_no ?? 0;
+    const workersOffered = (Number.isFinite(Number(workers_no)) && Number(workers_no) >= 1)
+      ? Math.round(Number(workers_no))
+      : 1;
+
+    if (workersNeeded > 0) {
+      const pendingMsgs = await Message.find({
+        site:       siteId,
+        type:       'application',
+        status:     'pending',
+        tradeName:  { $regex: new RegExp(`^${pro.professionality}$`, 'i') },
+      }).select('workersOffered');
+      const totalPending = pendingMsgs.reduce((s, m) => s + (m.workersOffered || 1), 0);
+      const workersLeft  = Math.max(0, workersNeeded - totalPending);
+
+      if (workersLeft <= 0) {
+        return res.status(409).json({ slotsFull: true, message: 'All worker slots are currently full.' });
+      }
+      if (workersOffered > workersLeft) {
+        return res.status(409).json({ tooMany: true, workersLeft, message: `Only ${workersLeft} slot(s) remaining.` });
+      }
+    }
+
     // Upsert: single Message record with type:'application' replaces the old
     // Application collection — one document tracks the whole flow.
     await Message.findOneAndUpdate(
       { tradePro: req.userId, site: siteId, type: 'application' },
-      { $set: { contractor: site.contractor._id, requestedDate: date || '', status: 'pending', senderType: 'trade' } },
+      { $set: {
+          contractor:    site.contractor._id,
+          requestedDate: date || '',
+          status:        'pending',
+          senderType:    'trade',
+          tradeName:     pro.professionality,
+          workersOffered,
+        }
+      },
       { upsert: true, new: true }
     );
 
