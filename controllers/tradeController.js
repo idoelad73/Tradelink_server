@@ -174,39 +174,107 @@ export async function approveBooking(req, res) {
     if (!token) return res.status(400).send(page('Error', '<p style="color:#ef4444;font-size:15px">Missing booking token.</p>', '#ef4444'));
 
     const decoded = jwt.verify(token, process.env.JWT_SECRET);
-    const { tradeId, date, siteName, siteAddress } = decoded;
+    const { tradeId, date, siteName, siteAddress,
+            siteId = null, tradeName = '', workersOffered = 1 } = decoded;
+
+    console.log(`\n[approveBooking] ── TOKEN ────────────────────────────`);
+    console.log(`  tradeId       : ${tradeId}`);
+    console.log(`  date          : ${date}`);
+    console.log(`  siteName      : ${siteName}`);
+    console.log(`  siteId        : ${siteId ?? '⚠️  NULL (old token)'}`);
+    console.log(`  tradeName     : "${tradeName}"`);
+    console.log(`  workersOffered: ${workersOffered}`);
 
     const pro = await TradePro.findById(tradeId);
     if (!pro) return res.status(404).send(page('Error', '<p style="color:#ef4444;font-size:15px">Trade professional not found.</p>', '#ef4444'));
+
+    console.log(`  pro.professionality: ${pro.professionality}`);
 
     const displayDate = new Date(date + 'T12:00:00').toLocaleDateString('en-US', {
       weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
     });
 
-    // Pull any existing 'order' entry for same site, then push confirmed 'booked'
-    // so the trade calendar always shows RED (not amber) after approval.
-    await TradePro.findByIdAndUpdate(tradeId, {
-      $pull: { bookings: { siteName } },
-    });
-    await TradePro.findByIdAndUpdate(tradeId, {
-      $push: { bookings: { siteName, siteAddress, dates: [date], status: 'booked' } },
-    });
-    console.log(`[approveBooking] ${pro.fullName} confirmed for "${siteName}" on ${date}`);
+    // Fetch site data for totalHours and workers_no calculation
+    const site = siteId ? await Site.findById(siteId).select('tradesNeeded').lean() : null;
+    const tradeSlot = site?.tradesNeeded?.find(
+      (t) => t.name?.toLowerCase() === (tradeName || pro.professionality || '').toLowerCase()
+    );
+    console.log(`  site found    : ${site ? 'YES' : 'NO (siteId was null)'}`);
+    console.log(`  tradeSlot     : ${tradeSlot ? JSON.stringify({ name: tradeSlot.name, workers_no: tradeSlot.workers_no }) : 'NOT FOUND'}`);
 
-    // Mark the matching pending message as approved and set assigned:true on the site
+    // Pull any existing entry for same site, then push confirmed 'booked' with full context
+    await TradePro.findByIdAndUpdate(tradeId, {
+      $pull: siteId ? { bookings: { siteId } } : { bookings: { siteName } },
+    });
+    await TradePro.findByIdAndUpdate(tradeId, {
+      $push: { bookings: {
+        siteId:      siteId ?? undefined,
+        siteName,
+        siteAddress,
+        dates:       [date],
+        status:      'booked',
+        totalHours:  tradeSlot?.totalHours ?? null,
+        workers_no:  workersOffered,
+      }},
+    });
+    console.log(`[approveBooking] ✓ booking pushed for "${siteName}" on ${date}`);
+
+    // Mark the matching pending availability message as approved
+    // Also handles already-approved messages (re-click) by looking up by any status
     const approvedMsg = await Message.findOneAndUpdate(
-      { tradePro: tradeId, requestedDate: date, status: 'pending' },
+      { tradePro: tradeId, requestedDate: date, status: 'pending',
+        ...(siteId ? { site: siteId } : {}) },
       { status: 'approved' },
       { new: true }
     );
-    if (approvedMsg?.site && pro?.professionality) {
-      await Site.updateOne(
-        {
-          _id: approvedMsg.site,
-          'tradesNeeded.name': { $regex: new RegExp(`^${pro.professionality}$`, 'i') },
-        },
-        { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': tradeId, 'tradesNeeded.$.requiredDate': date } }
+    // Fallback: message may already be approved (link clicked twice) — still find it for siteId
+    const msgForSite = approvedMsg
+      ?? await Message.findOne({
+           tradePro: tradeId, requestedDate: date,
+           ...(siteId ? { site: siteId } : {}),
+         }).lean();
+
+    console.log(`[approveBooking] approvedMsg : ${approvedMsg ? 'FOUND+UPDATED' : 'null (already approved or not found)'}`);
+    console.log(`[approveBooking] msgForSite  : ${msgForSite ? `site=${msgForSite.site}` : 'null'}`);
+
+    // Decrement workers_no and set assigned on the site trade slot
+    const resolvedSiteId = siteId || msgForSite?.site;
+    console.log(`[approveBooking] resolvedSiteId: ${resolvedSiteId ?? '⚠️  NONE — skipping site update'}`);
+
+    if (resolvedSiteId && pro?.professionality) {
+      const resolvedSite = site ?? await Site.findById(resolvedSiteId).select('tradesNeeded').lean();
+      const tradeKey = tradeName || pro.professionality;
+      const slot = resolvedSite?.tradesNeeded?.find(
+        (t) => t.name?.toLowerCase() === tradeKey.toLowerCase()
       );
+      console.log(`[approveBooking] slot lookup key="${tradeKey}" → ${slot ? `workers_no=${slot.workers_no}` : '⚠️  NOT FOUND'}`);
+
+      const currentWorkers  = slot?.workers_no ?? 0;
+      const newWorkersCount = Math.max(0, currentWorkers - workersOffered);
+      const totalHours      = slot?.totalHours ?? null;
+      const newTotalWorkingHrs = (slot?.budgetType === 'hours' && totalHours)
+        ? totalHours * newWorkersCount : null;
+
+      console.log(`[approveBooking] workers: ${currentWorkers} → ${newWorkersCount} (offered ${workersOffered})`);
+
+      const siteSet = {
+        'tradesNeeded.$.assigned':     true,
+        'tradesNeeded.$.tradeProId':   tradeId,
+        'tradesNeeded.$.workers_no':   newWorkersCount,
+        'tradesNeeded.$.requiredDate': date,
+      };
+      if (newTotalWorkingHrs !== null) siteSet['tradesNeeded.$.totalWorkingHrs'] = newTotalWorkingHrs;
+
+      const updateResult = await Site.updateOne(
+        {
+          _id: resolvedSiteId,
+          'tradesNeeded.name': { $regex: new RegExp(`^${tradeKey}$`, 'i') },
+        },
+        { $set: siteSet }
+      );
+      console.log(`[approveBooking] Site.updateOne result: matched=${updateResult.matchedCount} modified=${updateResult.modifiedCount}`);
+    } else {
+      console.log(`[approveBooking] ⚠️  SKIPPED site update — resolvedSiteId=${resolvedSiteId} professionality=${pro?.professionality}`);
     }
 
     const body = `
@@ -295,17 +363,29 @@ export async function getMessages(req, res, next) {
 // PATCH /api/trade/messages/:id/approve
 export async function approveMessage(req, res, next) {
   try {
+    const workersOffered = Math.max(1, parseInt(req.body?.workersOffered) || 1);
+
     const msg = await Message.findOne({ _id: req.params.id, tradePro: req.userId })
-      .populate('site', 'name address');
+      .populate('site', 'name address tradesNeeded');
     if (!msg) return res.status(404).json({ message: 'Message not found' });
     if (msg.status === 'approved') return res.json({ message: 'Already approved' });
 
-    // Mark approved
-    msg.status = 'approved';
+    const pro = await TradePro.findById(req.userId).select('professionality');
+
+    // Find the relevant trade slot for context
+    const tradeName = msg.tradeName || pro?.professionality || '';
+    const tradeSlot = msg.site?.tradesNeeded?.find(
+      (t) => t.name?.toLowerCase() === tradeName.toLowerCase()
+    );
+
+    const totalHours = tradeSlot?.totalHours ?? null;
+
+    // Mark availability message as approved + save workers chosen by trade pro
+    msg.status         = 'approved';
+    msg.workersOffered = workersOffered;
     await msg.save();
 
-    // Always replace any existing entry for this site (could be 'order' from applyForJob)
-    // with a confirmed 'booked' entry so the calendar shows RED not amber.
+    // Push booking onto trade pro (confirmed from their side, pending contractor acknowledgement)
     await TradePro.findByIdAndUpdate(req.userId, {
       $pull: { bookings: { siteId: msg.site._id } },
     });
@@ -316,20 +396,26 @@ export async function approveMessage(req, res, next) {
         siteAddress: msg.site.address,
         dates:       [msg.requestedDate],
         status:      'booked',
+        totalHours:  totalHours,
+        workers_no:  workersOffered,
       }},
     });
 
-    // Set assigned:true on the site's tradesNeeded entry immediately
-    const pro = await TradePro.findById(req.userId).select('professionality');
-    if (pro?.professionality && msg.site?._id) {
-      await Site.updateOne(
-        {
-          _id: msg.site._id,
-          'tradesNeeded.name': { $regex: new RegExp(`^${pro.professionality}$`, 'i') },
-        },
-        { $set: { 'tradesNeeded.$.assigned': true, 'tradesNeeded.$.tradeProId': req.userId, 'tradesNeeded.$.requiredDate': msg.requestedDate } }
-      );
-    }
+    // Create a worker_offer message for the contractor to approve.
+    // workers_no on the site is only decremented after contractor approves.
+    await Message.create({
+      tradePro:      req.userId,
+      site:          msg.site._id,
+      contractor:    msg.contractor,
+      requestedDate: msg.requestedDate,
+      tradeName:     tradeName,
+      workersOffered,
+      status:        'pending',
+      type:          'worker_offer',
+      senderType:    'trade',
+    });
+
+    console.log(`[approveMessage] worker_offer created — ${pro?.professionality} offering ${workersOffered} workers for "${msg.site?.name}"`);
 
     res.json({ ok: true });
   } catch (err) {

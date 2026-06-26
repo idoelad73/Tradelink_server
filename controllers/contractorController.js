@@ -189,24 +189,9 @@ export async function getWorkersLeft(req, res, next) {
     const tradeEntry    = site.tradesNeeded?.find((t) => t.name === tradeName);
     const workersNeeded = tradeEntry?.workers_no ?? 0;
 
-    if (!workersNeeded) {
-      return res.json({ workersNeeded: 0, workersOffered: 0, workersLeft: 0, isFull: false });
-    }
-
-    // Sum only PENDING availability messages for this slot.
-    // Accepted messages are already reflected in the decremented workers_no,
-    // so counting them again would double-subtract their workers.
-    const messages = await Message.find({
-      site:          siteId,
-      tradeName,
-      requestedDate: date,
-      status:        'pending',
-    }).select('workersOffered').lean();
-
-    const totalOffered = messages.reduce((sum, m) => sum + (m.workersOffered || 1), 0);
-    const workersLeft  = Math.max(0, workersNeeded - totalOffered);
-
-    res.json({ workersNeeded, workersOffered: totalOffered, workersLeft, isFull: workersLeft <= 0 });
+    // workers_no IS the remaining slots — it's decremented on approval, not on pending request.
+    // Return it directly so the search bar only reflects approved bookings.
+    res.json({ workersNeeded, workersOffered: 0, workersLeft: workersNeeded, isFull: workersNeeded <= 0 });
   } catch (err) {
     next(err);
   }
@@ -217,33 +202,19 @@ export async function getWorkersLeft(req, res, next) {
 export async function askAvailability(req, res, next) {
   try {
     const { date, siteName, siteAddress = '', lang = 'en', siteId,
-            tradeName = '', workersOffered = 1 } = req.body;
+            tradeName = '' } = req.body;
+    const workersOffered = 1; // contractor never sets workers — trade pro determines this
     if (!date) return res.status(400).json({ message: 'date is required' });
 
     // ── Check worker slots before doing anything else ─────────────────────
+    // workers_no is decremented on approval, so it's the authoritative remaining count.
     if (siteId && tradeName) {
       const site = await Site.findById(siteId).select('tradesNeeded').lean();
       const tradeEntry    = site?.tradesNeeded?.find((t) => t.name === tradeName);
       const workersNeeded = tradeEntry?.workers_no ?? 0;
 
-      if (workersNeeded > 0) {
-        // Count ONLY pending messages — accepted ones already decremented workers_no
-        // in the DB (approveAvailabilityRequest does this). Counting them again here
-        // would double-subtract and make available slots appear lower than they are.
-        const existing = await Message.find({
-          site: siteId, tradeName, requestedDate: date, status: 'pending',
-        }).select('workersOffered').lean();
-
-        const totalOffered = existing.reduce((sum, m) => sum + (m.workersOffered || 1), 0);
-        const workersLeft  = workersNeeded - totalOffered;
-
-        if (workersLeft <= 0) {
-          return res.status(409).json({ slotsFull: true, message: 'All worker slots are filled for this trade and date.' });
-        }
-        const requested = parseInt(workersOffered) || 1;
-        if (requested > workersLeft) {
-          return res.status(409).json({ tooMany: true, workersLeft, message: `Only ${workersLeft} slot(s) remaining.` });
-        }
+      if (workersNeeded <= 0 && tradeEntry) {
+        return res.status(409).json({ slotsFull: true, message: 'All worker slots are filled for this trade and date.' });
       }
     }
 
@@ -325,7 +296,8 @@ export async function askAvailability(req, res, next) {
 
     // Signed token for the one-click approve button (valid 7 days)
     const bookingToken = jwt.sign(
-      { tradeId: pro._id.toString(), date, siteName: siteName || '', siteAddress },
+      { tradeId: pro._id.toString(), date, siteName: siteName || '', siteAddress,
+        siteId: siteId || null, tradeName: tradeName || '', workersOffered: 1 },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -361,7 +333,7 @@ export async function askAvailability(req, res, next) {
         contractor:     req.userId,
         requestedDate:  date,
         tradeName,
-        workersOffered: parseInt(workersOffered) || 1,
+        workersOffered: 1,
         status:         'pending',
         type:           'availability',
         senderType:     'contractor',
@@ -383,9 +355,13 @@ export async function askAvailability(req, res, next) {
 // Returns approved availability messages for this contractor (status is the only truth)
 export async function getNotifications(req, res, next) {
   try {
+    // Only show availability requests the contractor sent that were approved by the trade pro
+    // (senderType:'contractor' + type:'availability' + status:'approved' = trade pro clicked the email link)
     const notifications = await Message.find({
-      contractor: req.userId,
-      status:     'approved',
+      contractor:  req.userId,
+      type:        'availability',
+      senderType:  'contractor',
+      status:      'approved',
     })
       .populate('tradePro', 'fullName professionality photo')
       .populate('site',     'name')
@@ -480,7 +456,8 @@ export async function requestWorkPlanDate(req, res, next) {
 
     const serverUrl    = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3000}`;
     const bookingToken = jwt.sign(
-      { tradeId: String(pro._id), date: requiredDate, siteName: site.name, siteAddress: site.address },
+      { tradeId: String(pro._id), date: requiredDate, siteName: site.name, siteAddress: site.address,
+        siteId: String(req.params.id), tradeName, workersOffered: tradeEntry?.workers_no ?? 1 },
       process.env.JWT_SECRET,
       { expiresIn: '7d' }
     );
@@ -606,20 +583,82 @@ export async function getApplications(req, res, next) {
 
     const reschedules = rescheduleRequests.map(m => ({ ...m, _isReschedule: true }));
 
-    // Pending availability requests sent BY this contractor (awaiting trade pro response)
-    const sentAvailability = await Message.find({
+    // Pending worker_offer messages from trade pros awaiting contractor approval
+    const workerOffers = await Message.find({
       contractor: req.userId,
-      type:       'availability',
+      type:       'worker_offer',
       status:     'pending',
     })
-      .populate('tradePro', 'fullName professionality photo')
-      .populate('site',     'name address')
+      .populate('tradePro', 'fullName professionality photo hourlyRate')
+      .populate('site',     'name address type photo tradesNeeded')
       .sort({ createdAt: -1 })
       .lean();
 
-    const sentRequests = sentAvailability.map(m => ({ ...m, _isSentRequest: true }));
+    res.json({ applications: marked, reschedules, sentRequests: [], workerOffers });
+  } catch (err) {
+    next(err);
+  }
+}
 
-    res.json({ applications: marked, reschedules, sentRequests });
+// PATCH /api/contractor/messages/:id/approve-worker-offer
+// Contractor approves the trade pro's worker count → decrements workers_no on site
+export async function approveWorkerOffer(req, res, next) {
+  try {
+    const msg = await Message.findOne({
+      _id:        req.params.id,
+      contractor: req.userId,
+      type:       'worker_offer',
+      status:     'pending',
+    })
+      .populate('tradePro', 'professionality fullName hourlyRate')
+      .populate('site',     'name address tradesNeeded contractor');
+
+    if (!msg) return res.status(404).json({ message: 'Worker offer not found' });
+
+    const tradeSlot = msg.site?.tradesNeeded?.find(
+      (t) => t.name?.toLowerCase() === (msg.tradeName || msg.tradePro?.professionality || '').toLowerCase()
+    );
+
+    const workersOffered     = msg.workersOffered ?? 1;
+    const currentWorkers     = tradeSlot?.workers_no ?? 0;
+    const newWorkersCount    = Math.max(0, currentWorkers - workersOffered);
+    const totalHours         = tradeSlot?.totalHours ?? null;
+    const hourlyRate         = msg.tradePro?.hourlyRate ?? null;
+    const newTotalWorkingHrs = (tradeSlot?.budgetType === 'hours' && totalHours)
+      ? totalHours * newWorkersCount : null;
+
+    const minDeposit = (hourlyRate && totalHours)
+      ? parseFloat((workersOffered * hourlyRate * totalHours).toFixed(2))
+      : null;
+
+    // Mark message approved + set min_deposit
+    msg.status      = 'approved';
+    msg.min_deposit = minDeposit;
+    await msg.save();
+
+    // Decrement workers_no on the site trade slot
+    const professionality = msg.tradePro?.professionality || msg.tradeName;
+    if (professionality && msg.site?._id) {
+      const siteSet = {
+        'tradesNeeded.$.assigned':     true,
+        'tradesNeeded.$.tradeProId':   msg.tradePro._id,
+        'tradesNeeded.$.workers_no':   newWorkersCount,
+        'tradesNeeded.$.requiredDate': msg.requestedDate,
+      };
+      if (newTotalWorkingHrs !== null) siteSet['tradesNeeded.$.totalWorkingHrs'] = newTotalWorkingHrs;
+
+      await Site.updateOne(
+        {
+          _id: msg.site._id,
+          'tradesNeeded.name': { $regex: new RegExp(`^${professionality}$`, 'i') },
+        },
+        { $set: siteSet }
+      );
+    }
+
+    console.log(`[approveWorkerOffer] ${professionality} — ${workersOffered} workers approved, site slots: ${currentWorkers}→${newWorkersCount}`);
+
+    res.json({ ok: true, slotsRemaining: newWorkersCount, siteId: String(msg.site._id) });
   } catch (err) {
     next(err);
   }
@@ -697,7 +736,7 @@ export async function approveApplication(req, res, next) {
 
     // Application is now stored as a Message with type:'application'
     const app = await Message.findOne({ _id: req.params.id, type: 'application' })
-      .populate('tradePro', 'professionality fullName email')
+      .populate('tradePro', 'professionality fullName email hourlyRate')
       .populate('site',     'name address tradesNeeded contractor');
     if (!app) return res.status(404).json({ message: 'Application not found' });
 
@@ -758,13 +797,21 @@ export async function approveApplication(req, res, next) {
     const companyName = contractor?.companyName || 'Your contractor';
 
     // Create in-app approval message for the trade pro
+    const approvalWorkers = app.workersOffered ?? 1;
+    const approvalRate    = app.tradePro.hourlyRate ?? null;
+    const approvalHours   = tradeSlot?.totalHours ?? null;
+    const minDeposit = (approvalRate && approvalHours)
+      ? parseFloat((approvalWorkers * approvalRate * approvalHours).toFixed(2))
+      : null;
+
     await Message.create({
       tradePro:       app.tradePro._id,
       site:           app.site._id,
       contractor:     req.userId,
       requestedDate:  finalDate || '',
       tradeName:      app.tradePro.professionality || '',
-      workersOffered: app.workersOffered ?? 1,   // ← carry through from the application
+      workersOffered: approvalWorkers,
+      min_deposit:    minDeposit,
       status:         'approved',
       type:           'approval',
       senderType:     'contractor',
@@ -838,6 +885,8 @@ export async function approveApplication(req, res, next) {
       blockedTradeProId:   String(app.tradePro._id),
       blockedDate:         finalDate || null,
       blockedApplicationIds: siblingApplicationIds.map(String),
+      slotsRemaining:      newWorkersCount,
+      siteId:              String(app.site._id),
     });
   } catch (err) {
     next(err);
@@ -854,7 +903,7 @@ export async function approveAvailabilityRequest(req, res, next) {
       type:       'availability',
       status:     'pending',
     })
-      .populate('tradePro', 'professionality fullName email')
+      .populate('tradePro', 'professionality fullName email hourlyRate')
       .populate('site',     'name address tradesNeeded contractor');
 
     if (!msg) return res.status(404).json({ message: 'Request not found' });
@@ -919,14 +968,23 @@ export async function approveAvailabilityRequest(req, res, next) {
     }
 
     // 4. Create in-app approval message for the trade pro
+    const avReqWorkers  = msg.workersOffered ?? 1;
+    const avReqRate     = msg.tradePro.hourlyRate ?? null;
+    const avReqHours    = tradeSlot?.totalHours ?? null;
+    const avReqDeposit  = (avReqRate && avReqHours)
+      ? parseFloat((avReqWorkers * avReqRate * avReqHours).toFixed(2))
+      : null;
+
     await Message.create({
-      tradePro:      msg.tradePro._id,
-      site:          msg.site._id,
-      contractor:    req.userId,
-      requestedDate: finalDate || '',
-      status:        'approved',
-      type:          'approval',
-      senderType:    'contractor',
+      tradePro:       msg.tradePro._id,
+      site:           msg.site._id,
+      contractor:     req.userId,
+      requestedDate:  finalDate || '',
+      workersOffered: avReqWorkers,
+      min_deposit:    avReqDeposit,
+      status:         'approved',
+      type:           'approval',
+      senderType:     'contractor',
     });
     await TradePro.findByIdAndUpdate(msg.tradePro._id, { $inc: { availabilityMessages: 1 } });
 
@@ -981,7 +1039,52 @@ export async function approveAvailabilityRequest(req, res, next) {
       console.log(`[approveAvailabilityRequest] Approval email sent to ${msg.tradePro.email}`);
     }
 
-    res.json({ ok: true });
+    res.json({ ok: true, slotsRemaining: newWorkersCount, siteId: String(msg.site._id) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/contractor/sites/:siteId/deposit-summary
+export async function getSiteDepositSummary(req, res, next) {
+  try {
+    const { siteId } = req.params;
+
+    const messages = await Message.find({
+      site:       siteId,
+      contractor: req.userId,
+      type:       'approval',
+    })
+      .populate('tradePro', 'fullName professionality hourlyRate')
+      .populate('site', 'name tradesNeeded')
+      .lean();
+
+    const rows = messages.map((msg) => {
+      const tradeSlot = msg.site?.tradesNeeded?.find(
+        (t) => t.name?.toLowerCase() === (msg.tradePro?.professionality ?? '').toLowerCase()
+      );
+      const workers = msg.workersOffered ?? 1;
+      const rate    = msg.tradePro?.hourlyRate ?? null;
+      const hours   = tradeSlot?.totalHours ?? null;
+      const deposit = msg.min_deposit ??
+        (rate && hours ? parseFloat((workers * rate * hours).toFixed(2)) : null);
+
+      return {
+        messageId:      String(msg._id),
+        tradeName:      msg.tradeName || msg.tradePro?.professionality || '—',
+        professionality: msg.tradePro?.professionality || '—',
+        tradeProName:   msg.tradePro?.fullName || '—',
+        workers,
+        hourlyRate:     rate,
+        totalHours:     hours,
+        min_deposit:    deposit,
+      };
+    });
+
+    const total = parseFloat(rows.reduce((s, r) => s + (r.min_deposit ?? 0), 0).toFixed(2));
+    const siteName = messages[0]?.site?.name || '';
+
+    res.json({ rows, total, siteName });
   } catch (err) {
     next(err);
   }
@@ -1050,16 +1153,43 @@ export async function findTrades(req, res, next) {
     const now = new Date();
     const todayKey = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
 
-    const pipeline = [
-      {
-        $geoNear: {
-          near:          { type: 'Point', coordinates: [lng, lat] },
-          distanceField: 'distance',
-          maxDistance:   meters,
-          query:         { professionality: trade },
-          spherical:     true,
+    // Haversine distance (meters) computed purely from stored coordinates.
+    // Uses no geo index — works regardless of BSON type or index state.
+    const haversineExpr = {
+      $let: {
+        vars: {
+          dLat: { $degreesToRadians: { $subtract: [lat, { $arrayElemAt: ['$location.coordinates', 1] }] } },
+          dLng: { $degreesToRadians: { $subtract: [lng, { $arrayElemAt: ['$location.coordinates', 0] }] } },
+          lat1: { $degreesToRadians: { $arrayElemAt: ['$location.coordinates', 1] } },
+          lat2: { $degreesToRadians: lat },
+        },
+        in: {
+          $multiply: [
+            2 * 6371000,
+            { $asin: {
+              $sqrt: {
+                $add: [
+                  { $pow: [{ $sin: { $divide: ['$$dLat', 2] } }, 2] },
+                  { $multiply: [
+                    { $cos: '$$lat1' },
+                    { $cos: '$$lat2' },
+                    { $pow: [{ $sin: { $divide: ['$$dLng', 2] } }, 2] },
+                  ]},
+                ],
+              },
+            }},
+          ],
         },
       },
+    };
+
+    const pipeline = [
+      // 1. Profession filter — uses the professionality index
+      { $match: { professionality: trade } },
+      // 2. Compute Haversine distance from the site to each trade's stored coordinates
+      { $addFields: { distance: haversineExpr } },
+      // 3. Keep only trades within the requested radius
+      { $match: { distance: { $lte: meters } } },
     ];
 
     // Optional rate ceiling — include pros with no rate set
@@ -1075,10 +1205,17 @@ export async function findTrades(req, res, next) {
       });
     }
 
-    // Optional minimum grade filter — only include trades with avgGrade >= minGrade
+    // Optional minimum grade filter — graded trades must meet the minimum;
+    // ungraded trades (avgGrade: null) are always included regardless of the filter.
     if (minGrade > 0) {
       pipeline.push({
-        $match: { avgGrade: { $gte: minGrade } },
+        $match: {
+          $or: [
+            { avgGrade: { $gte: minGrade } },
+            { avgGrade: null },
+            { avgGrade: { $exists: false } },
+          ],
+        },
       });
     }
 

@@ -1,6 +1,6 @@
 import { Router }              from 'express';
 import { protect, restrictTo } from '../middleware/auth.js';
-import { createPaymentIntent, handleWebhook } from '../controllers/stripeController.js';
+import { createPaymentIntent, createDepositIntent, handleWebhook } from '../controllers/stripeController.js';
 
 const router = Router();
 
@@ -29,7 +29,8 @@ try {
 // ── Authenticated contractor routes ──────────────────────────────────────────
 router.use(protect, restrictTo('contractor'));
 
-router.post('/create-payment-intent', paymentLimiter, createPaymentIntent);
+router.post('/create-payment-intent',  paymentLimiter, createPaymentIntent);
+router.post('/create-deposit-intent',  paymentLimiter, createDepositIntent);
 
 export { handleWebhook };
 export default router;

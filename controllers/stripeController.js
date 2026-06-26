@@ -2,6 +2,7 @@ import stripe       from '../utils/stripe.js';
 import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import Contractor     from '../models/Contractor.js';
 import TradePro       from '../models/TradePro.js';
+import Message        from '../models/Message.js';
 
 // Platform fee % read from .env — e.g. STRIPE_PLATFORM_FEE_PERCENT=5  means 5%
 const PLATFORM_FEE_PERCENT = parseFloat(process.env.STRIPE_PLATFORM_FEE_PERCENT ?? '0');
@@ -116,6 +117,59 @@ export async function createPaymentIntent(req, res, next) {
   }
 }
 
+// ── POST /api/stripe/create-deposit-intent ───────────────────────────────────
+// Creates a PaymentIntent with capture_method:'manual' — authorizes (holds) the
+// card but does NOT charge it. Call stripe.paymentIntents.capture() later to settle.
+export async function createDepositIntent(req, res, next) {
+  try {
+    const { siteId, amount } = req.body;
+
+    if (!siteId || !amount || amount <= 0) {
+      return res.status(400).json({ message: 'siteId and amount are required' });
+    }
+
+    const contractor = await Contractor.findById(req.userId)
+      .select('email companyName stripeCustomerId').lean();
+
+    let customerId = contractor.stripeCustomerId;
+    if (!customerId) {
+      const customer = await stripe.customers.create({
+        email: contractor.email,
+        name:  contractor.companyName,
+        metadata: { contractorId: String(contractor._id) },
+      });
+      customerId = customer.id;
+      await Contractor.findByIdAndUpdate(req.userId, { stripeCustomerId: customerId });
+    }
+
+    const amountCents = Math.round(amount * 100);
+
+    const paymentIntent = await stripe.paymentIntents.create({
+      amount:   amountCents,
+      currency: 'usd',
+      customer: customerId,
+      capture_method: 'manual',
+      automatic_payment_methods: { enabled: true },
+      metadata: {
+        siteId:       String(siteId),
+        contractorId: String(req.userId),
+        type:         'deposit',
+      },
+      description: `TradeLink — Deposit hold for project ${siteId}`,
+    }, { idempotencyKey: `deposit-${req.userId}-${siteId}` });
+
+    // Stamp PI ID + pending status onto all approval messages for this site
+    await Message.updateMany(
+      { site: siteId, contractor: req.userId, type: 'approval' },
+      { stripeDepositIntentId: paymentIntent.id, depositStatus: 'pending' }
+    );
+
+    res.json({ clientSecret: paymentIntent.client_secret, amount });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ── POST /api/stripe/webhook ──────────────────────────────────────────────────
 // MUST be registered with express.raw({ type: 'application/json' }) — see app.js.
 // Verifies Stripe signature (rule #5) then updates order paymentStatus.
@@ -186,6 +240,20 @@ export async function handleWebhook(req, res) {
         console.log(`   Status  : ${pi.status ?? '—'}`);
         console.log(`   Amount  : $${((pi.amount ?? 0) / 100).toFixed(2)}`);
         break;
+
+      // ── Deposit hold authorized (manual capture PI) ──────────────────────
+      case 'payment_intent.amount_capturable_updated': {
+        const depositType = pi.metadata?.type;
+        const depositSite = pi.metadata?.siteId;
+        if (depositType === 'deposit' && depositSite) {
+          await Message.updateMany(
+            { stripeDepositIntentId: piId, type: 'approval' },
+            { depositStatus: 'held' }
+          );
+          console.log(`\n🔒 [Stripe] deposit held for site ${depositSite} | PI: ${piId}`);
+        }
+        break;
+      }
 
       case 'payment_intent.payment_failed':
         console.warn(`\n❌ [Stripe] payment_intent.payment_failed`);

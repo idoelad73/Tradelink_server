@@ -5,12 +5,13 @@ import {
   getMe, updateMe,
   createSite, getSites, getSite, updateSite, deleteSite, findTrades,
   getTradeBusyDays, askAvailability, getWorkersLeft,
-  getApplications, approveApplication, approveAvailabilityRequest,
+  getApplications, approveApplication, approveAvailabilityRequest, approveWorkerOffer,
   getNotifications, markNotificationsRead,
   getWorkPlan, updateWorkPlanDate, deleteWorkPlanTrade, requestWorkPlanDate,
   approveReschedule, declineReschedule,
   getPaymentApprovalsCount, getPaymentApprovals, updatePaymentApproval,
   getGradableTrades, submitTradeGrade,
+  getSiteDepositSummary,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -36,6 +37,7 @@ router.patch('/applications/:id/approve',          approveApplication);
 router.patch('/messages/:id/approve-reschedule',   approveReschedule);
 router.patch('/messages/:id/decline-reschedule',   declineReschedule);
 router.patch('/messages/:id/approve-availability', approveAvailabilityRequest);
+router.patch('/messages/:id/approve-worker-offer', approveWorkerOffer);
 
 // Availability-approved notifications
 router.get('/notifications',       getNotifications);
@@ -56,6 +58,7 @@ router.get('/sites',        getSites);
 router.get('/trade-pros/:tradeId/busy-days',         getTradeBusyDays);
 router.post('/trade-pros/:tradeId/ask-availability', askAvailability);
 router.get('/sites/:siteId/workers-left',            getWorkersLeft);
+router.get('/sites/:siteId/deposit-summary',         getSiteDepositSummary);
 router.get('/sites/:id',              getSite);
 router.get('/sites/:id/work-plan',            getWorkPlan);
 router.post('/sites/:id/work-plan/request-date', requestWorkPlanDate);

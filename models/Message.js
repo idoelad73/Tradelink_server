@@ -4,15 +4,16 @@ const { Schema } = mongoose;
 /**
  * Unified "JobRequest / Message" collection.
  *
- * type        | senderType  | status             | meaning
- * ------------|-------------|--------------------|-----------------------------------------
- * application | trade       | pending/approved   | Trade pro applied to work on a site
- * availability| contractor  | pending            | Contractor asked if trade is available
- * approval    | contractor  | approved           | Contractor approved the trade
- * reschedule  | trade       | pending            | Trade pro asked to change booked date
- * payment     | trade       | pending            | Trade submitted hours (no WorkHoursOrder yet)
- * payment     | contractor  | approved           | Contractor approved → WorkHoursOrder created
- * payment     | contractor  | rejected           | Contractor rejected → snapshot in text field
+ * type         | senderType  | status             | meaning
+ * -------------|-------------|--------------------|-----------------------------------------
+ * application  | trade       | pending/approved   | Trade pro applied to work on a site
+ * availability | contractor  | pending            | Contractor asked if trade is available
+ * approval     | contractor  | approved           | Contractor approved the trade
+ * reschedule   | trade       | pending            | Trade pro asked to change booked date
+ * worker_offer | trade       | pending/approved   | Trade pro confirmed workers count — awaits contractor approval
+ * payment      | trade       | pending            | Trade submitted hours (no WorkHoursOrder yet)
+ * payment      | contractor  | approved           | Contractor approved → WorkHoursOrder created
+ * payment      | contractor  | rejected           | Contractor rejected → snapshot in text field
  */
 const messageSchema = new Schema(
   {
@@ -23,6 +24,13 @@ const messageSchema = new Schema(
     text:          { type: String, default: '' },
     tradeName:      { type: String,  default: '' }, // e.g. 'Painter' — which trade slot this fills
     workersOffered: { type: Number,  default: 1  }, // how many workers this TradePro is offering
+    min_deposit:    { type: Number,  default: null }, // workersOffered × hourlyRate × totalHours (set on approval)
+    stripeDepositIntentId: { type: String, default: null },
+    depositStatus: {
+      type:    String,
+      enum:    ['pending', 'held', 'captured', 'released'],
+      default: null,
+    },
 
     status: {
       type:    String,
@@ -31,7 +39,7 @@ const messageSchema = new Schema(
     },
     type: {
       type:     String,
-      enum:     ['application', 'availability', 'approval', 'reschedule', 'payment'],
+      enum:     ['application', 'availability', 'approval', 'reschedule', 'worker_offer', 'payment'],
       required: true,
     },
     senderType: {
