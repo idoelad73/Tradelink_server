@@ -1049,19 +1049,39 @@ export async function approveAvailabilityRequest(req, res, next) {
 export async function getSiteDepositSummary(req, res, next) {
   try {
     const { siteId } = req.params;
+    console.log(`\n[depositSummary] ── siteId=${siteId} contractorId=${req.userId}`);
 
+    // If deposit already initiated for this site, return empty (no need to re-prompt)
+    const alreadyInitiated = await Message.findOne({
+      site:       siteId,
+      contractor: req.userId,
+      stripeDepositIntentId: { $ne: null },
+    }).lean();
+    if (alreadyInitiated) {
+      console.log(`[depositSummary] already initiated — stripeDepositIntentId=${alreadyInitiated.stripeDepositIntentId}`);
+      return res.json({ rows: [], total: 0, siteName: '', alreadyPaid: true });
+    }
+    console.log(`[depositSummary] no prior deposit found — querying approved messages`);
+
+    // Include both direct application approvals AND worker_offer approvals
     const messages = await Message.find({
       site:       siteId,
       contractor: req.userId,
-      type:       'approval',
+      type:       { $in: ['approval', 'worker_offer'] },
+      status:     'approved',
     })
       .populate('tradePro', 'fullName professionality hourlyRate')
       .populate('site', 'name tradesNeeded')
       .lean();
 
+    console.log(`[depositSummary] messages found: ${messages.length}`);
+    messages.forEach((m, i) => {
+      console.log(`  [${i}] type=${m.type} status=${m.status} tradeName=${m.tradeName} workersOffered=${m.workersOffered} min_deposit=${m.min_deposit} hourlyRate=${m.tradePro?.hourlyRate}`);
+    });
+
     const rows = messages.map((msg) => {
       const tradeSlot = msg.site?.tradesNeeded?.find(
-        (t) => t.name?.toLowerCase() === (msg.tradePro?.professionality ?? '').toLowerCase()
+        (t) => t.name?.toLowerCase() === (msg.tradeName || msg.tradePro?.professionality || '').toLowerCase()
       );
       const workers = msg.workersOffered ?? 1;
       const rate    = msg.tradePro?.hourlyRate ?? null;
@@ -1069,20 +1089,23 @@ export async function getSiteDepositSummary(req, res, next) {
       const deposit = msg.min_deposit ??
         (rate && hours ? parseFloat((workers * rate * hours).toFixed(2)) : null);
 
+      console.log(`  row: tradeName=${msg.tradeName} workers=${workers} rate=${rate} hours=${hours} tradeSlot=${JSON.stringify(tradeSlot?.name)} deposit=${deposit}`);
+
       return {
-        messageId:      String(msg._id),
-        tradeName:      msg.tradeName || msg.tradePro?.professionality || '—',
+        messageId:       String(msg._id),
+        tradeName:       msg.tradeName || msg.tradePro?.professionality || '—',
         professionality: msg.tradePro?.professionality || '—',
-        tradeProName:   msg.tradePro?.fullName || '—',
+        tradeProName:    msg.tradePro?.fullName || '—',
         workers,
-        hourlyRate:     rate,
-        totalHours:     hours,
-        min_deposit:    deposit,
+        hourlyRate:      rate,
+        totalHours:      hours,
+        min_deposit:     deposit,
       };
     });
 
     const total = parseFloat(rows.reduce((s, r) => s + (r.min_deposit ?? 0), 0).toFixed(2));
     const siteName = messages[0]?.site?.name || '';
+    console.log(`[depositSummary] total=$${total} siteName="${siteName}" → sending response`);
 
     res.json({ rows, total, siteName });
   } catch (err) {

@@ -156,7 +156,7 @@ export async function createDepositIntent(req, res, next) {
         type:         'deposit',
       },
       description: `TradeLink — Deposit hold for project ${siteId}`,
-    }, { idempotencyKey: `deposit-${req.userId}-${siteId}` });
+    }, { idempotencyKey: `deposit-${req.userId}-${siteId}-${amountCents}` });
 
     // Stamp PI ID + pending status onto all approval messages for this site
     await Message.updateMany(
