@@ -11,7 +11,7 @@ import {
   approveReschedule, declineReschedule,
   getPaymentApprovalsCount, getPaymentApprovals, updatePaymentApproval,
   getGradableTrades, submitTradeGrade,
-  getSiteDepositSummary,
+  getSiteDepositSummary, confirmDeposit,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -59,6 +59,7 @@ router.get('/trade-pros/:tradeId/busy-days',         getTradeBusyDays);
 router.post('/trade-pros/:tradeId/ask-availability', askAvailability);
 router.get('/sites/:siteId/workers-left',            getWorkersLeft);
 router.get('/sites/:siteId/deposit-summary',         getSiteDepositSummary);
+router.post('/deposit-confirmed',                    confirmDeposit);
 router.get('/sites/:id',              getSite);
 router.get('/sites/:id/work-plan',            getWorkPlan);
 router.post('/sites/:id/work-plan/request-date', requestWorkPlanDate);

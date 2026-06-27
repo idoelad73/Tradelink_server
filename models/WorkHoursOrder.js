@@ -60,7 +60,8 @@ const workHoursOrderSchema = new Schema(
       default: 'pending',
     },
     // ── Stripe payment tracking ──────────────────────────────────────────────
-    stripePaymentIntentId: { type: String, default: null },
+    stripePaymentIntentId: { type: String, default: null }, // deposit PI that was captured
+    stripeTransferId:      { type: String, default: null }, // transfer to trade pro's account
     paymentStatus: {
       type:    String,
       enum:    ['unpaid', 'pending', 'paid', 'failed'],

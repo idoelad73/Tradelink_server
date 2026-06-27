@@ -32,6 +32,7 @@ import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
 import { sendMail } from '../utils/mailer.js';
 import jwt from 'jsonwebtoken';
+import stripe from '../utils/stripe.js';
 
 // GET /api/contractor/me
 // Returns contractor profile + count of sites
@@ -113,7 +114,33 @@ export async function createSite(req, res, next) {
 export async function getSites(req, res, next) {
   try {
     const sites = await Site.find({ contractor: req.userId }).sort({ createdAt: -1 });
-    res.json({ sites });
+
+    // Find all confirmed deposit messages for this contractor
+    const depositedMsgs = await Message.find({
+      contractor: req.userId,
+      type:       'payment',
+      status:     'deposited',
+    }).select('site tradeName min_deposit').lean();
+
+    // Fast lookup: "siteId::tradeName" → { held, amount }
+    const heldMap = new Map(
+      depositedMsgs.map(m => [`${m.site}::${m.tradeName}`, m.min_deposit ?? null])
+    );
+
+    const sitesWithDeposit = sites.map(s => {
+      const obj = s.toObject();
+      obj.tradesNeeded = (obj.tradesNeeded || []).map(tr => {
+        const key = `${obj._id}::${tr.name}`;
+        return {
+          ...tr,
+          depositHeld:   heldMap.has(key),
+          depositAmount: heldMap.get(key) ?? null,
+        };
+      });
+      return obj;
+    });
+
+    res.json({ sites: sitesWithDeposit });
   } catch (err) {
     next(err);
   }
@@ -638,25 +665,34 @@ export async function approveWorkerOffer(req, res, next) {
 
     // Decrement workers_no on the site trade slot
     const professionality = msg.tradePro?.professionality || msg.tradeName;
+
+    console.log(`[approveWorkerOffer] trade="${professionality}" workersOffered=${workersOffered} slots: ${currentWorkers}→${newWorkersCount}`);
+    console.log(`[approveWorkerOffer] msg.requestedDate="${msg.requestedDate}" tradeSlot.requiredDate="${tradeSlot?.requiredDate}"`);
+
     if (professionality && msg.site?._id) {
+      // Preserve the existing date if the worker_offer message has no date
+      const resolvedDate = msg.requestedDate || tradeSlot?.requiredDate || null;
+      console.log(`[approveWorkerOffer] resolvedDate="${resolvedDate}"`);
+
       const siteSet = {
-        'tradesNeeded.$.assigned':     true,
-        'tradesNeeded.$.tradeProId':   msg.tradePro._id,
-        'tradesNeeded.$.workers_no':   newWorkersCount,
-        'tradesNeeded.$.requiredDate': msg.requestedDate,
+        'tradesNeeded.$.assigned':   true,
+        'tradesNeeded.$.tradeProId': msg.tradePro._id,
+        'tradesNeeded.$.workers_no': newWorkersCount,
       };
+      if (resolvedDate) siteSet['tradesNeeded.$.requiredDate'] = resolvedDate;
       if (newTotalWorkingHrs !== null) siteSet['tradesNeeded.$.totalWorkingHrs'] = newTotalWorkingHrs;
 
-      await Site.updateOne(
+      console.log('[approveWorkerOffer] siteSet:', JSON.stringify(siteSet));
+
+      const updateResult = await Site.updateOne(
         {
           _id: msg.site._id,
           'tradesNeeded.name': { $regex: new RegExp(`^${professionality}$`, 'i') },
         },
         { $set: siteSet }
       );
+      console.log(`[approveWorkerOffer] Site.updateOne matched=${updateResult.matchedCount} modified=${updateResult.modifiedCount}`);
     }
-
-    console.log(`[approveWorkerOffer] ${professionality} — ${workersOffered} workers approved, site slots: ${currentWorkers}→${newWorkersCount}`);
 
     res.json({ ok: true, slotsRemaining: newWorkersCount, siteId: String(msg.site._id) });
   } catch (err) {
@@ -769,13 +805,13 @@ export async function approveApplication(req, res, next) {
       : null;
 
     const siteUpdate = {
-      'tradesNeeded.$.tradeProId':  app.tradePro._id,
-      'tradesNeeded.$.workers_no':  newWorkersCount,
-      'tradesNeeded.$.assigned':    newWorkersCount <= 0,  // fully filled when no slots left
+      'tradesNeeded.$.tradeProId': app.tradePro._id,
+      'tradesNeeded.$.workers_no': newWorkersCount,
+      'tradesNeeded.$.assigned':   newWorkersCount <= 0,
     };
-    if (newTotalWorkingHrs !== null) {
-      siteUpdate['tradesNeeded.$.totalWorkingHrs'] = newTotalWorkingHrs;
-    }
+    if (newTotalWorkingHrs !== null) siteUpdate['tradesNeeded.$.totalWorkingHrs'] = newTotalWorkingHrs;
+    const appResolvedDate = finalDate || tradeSlot?.requiredDate || null;
+    if (appResolvedDate) siteUpdate['tradesNeeded.$.requiredDate'] = appResolvedDate;
 
     // Mark the matching trade slot + decrement remaining worker slots
     await Site.updateOne(
@@ -934,19 +970,21 @@ export async function approveAvailabilityRequest(req, res, next) {
     await msg.save();
 
     // 2. Update trade slot: decrement workers_no; mark assigned when fully filled
+    const avReqSlotSet = {
+      'tradesNeeded.$.assigned':       true,
+      'tradesNeeded.$.tradeProId':     msg.tradePro._id,
+      'tradesNeeded.$.workers_no':     newWorkersCount,
+      'tradesNeeded.$.totalWorkingHrs': newTotalWorkingHrs,
+    };
+    const avReqResolvedDate = finalDate || tradeSlot?.requiredDate || null;
+    if (avReqResolvedDate) avReqSlotSet['tradesNeeded.$.requiredDate'] = avReqResolvedDate;
+
     await Site.updateOne(
       {
         _id: msg.site._id,
         'tradesNeeded.name': { $regex: new RegExp(`^${msg.tradePro.professionality}$`, 'i') },
       },
-      {
-        $set: {
-          'tradesNeeded.$.assigned':         true,                // always mark as "has someone"
-          'tradesNeeded.$.tradeProId':        msg.tradePro._id,
-          'tradesNeeded.$.workers_no':        newWorkersCount,    // remaining slots after this booking
-          'tradesNeeded.$.totalWorkingHrs':   newTotalWorkingHrs, // totalHours × remaining workers
-        },
-      }
+      { $set: avReqSlotSet }
     );
 
     // 3. Push booking onto trade pro (as 'booked')
@@ -1108,6 +1146,70 @@ export async function getSiteDepositSummary(req, res, next) {
     console.log(`[depositSummary] total=$${total} siteName="${siteName}" → sending response`);
 
     res.json({ rows, total, siteName });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// POST /api/contractor/deposit-confirmed
+// Called from client after stripe.confirmPayment succeeds.
+// Verifies the PI hold with Stripe, marks depositStatus='held' on the worker_offer message,
+// and creates a new type:'payment' status:'deposited' message to record the deposit event.
+export async function confirmDeposit(req, res, next) {
+  try {
+    const { siteId, paymentIntentId } = req.body;
+    console.log(`\n[confirmDeposit] siteId=${siteId} piId=${paymentIntentId} contractorId=${req.userId}`);
+
+    if (!siteId || !paymentIntentId) {
+      return res.status(400).json({ message: 'siteId and paymentIntentId are required' });
+    }
+
+    // Verify with Stripe that the hold is in place
+    const pi = await stripe.paymentIntents.retrieve(paymentIntentId);
+    console.log(`[confirmDeposit] PI status=${pi.status}`);
+    if (!['requires_capture', 'succeeded'].includes(pi.status)) {
+      return res.status(400).json({ message: `Unexpected PI status: ${pi.status}` });
+    }
+
+    // Find the stamped source message — could be worker_offer OR approval type
+    const source = await Message.findOne({
+      site:       siteId,
+      contractor: req.userId,
+      stripeDepositIntentId: paymentIntentId,
+      type:       { $in: ['worker_offer', 'approval'] },
+    }).lean();
+
+    if (!source) {
+      console.log(`[confirmDeposit] ❌ no stamped source message found for PI=${paymentIntentId} site=${siteId}`);
+      return res.status(404).json({ message: 'Source message not found — deposit intent may not have been stamped' });
+    }
+    console.log(`[confirmDeposit] source message _id=${source._id} type=${source.type}`);
+
+    // Mark the worker_offer as held
+    await Message.findByIdAndUpdate(source._id, { depositStatus: 'held' });
+
+    // Use Stripe's amount as the authoritative deposit sum (pi.amount is in cents)
+    const stripeAmount = pi.amount / 100;
+
+    // Create the deposit record message
+    const depositMsg = await Message.create({
+      tradePro:      source.tradePro,
+      site:          source.site,
+      contractor:    source.contractor,
+      requestedDate: source.requestedDate,
+      tradeName:     source.tradeName,
+      workersOffered: source.workersOffered,
+      min_deposit:   stripeAmount,
+      stripeDepositIntentId: paymentIntentId,
+      depositStatus: 'held',
+      type:          'payment',
+      status:        'deposited',
+      senderType:    'contractor',
+    });
+    console.log(`[confirmDeposit] stripeAmount=$${stripeAmount} stored in deposit message`);
+
+    console.log(`[confirmDeposit] ✅ deposit message created _id=${depositMsg._id}`);
+    res.json({ ok: true, messageId: String(depositMsg._id) });
   } catch (err) {
     next(err);
   }
@@ -1405,7 +1507,7 @@ export async function updatePaymentApproval(req, res, next) {
 
     // The "order" is actually a pending payment message
     const pendingMsg = await Message.findOne({ _id: orderId, contractor: req.userId, type: 'payment', status: 'pending' })
-      .populate('tradePro', 'fullName professionality photo hourlyRate')
+      .populate('tradePro', 'fullName professionality photo hourlyRate stripeAccountId stripeOnboarded')
       .populate('site',     'name address tradesNeeded')   // ← tradesNeeded for min hours
       .lean();
 
@@ -1429,6 +1531,37 @@ export async function updatePaymentApproval(req, res, next) {
 
     const tradeId = pendingMsg.tradePro._id ?? pendingMsg.tradePro;
     const siteId  = pendingMsg.site?._id    ?? pendingMsg.site ?? null;
+
+    // ── OVERAGE CHECK (before order creation) ────────────────────────────────
+    // If lockedSum > depositHeld, the contractor must pay the difference now.
+    const overagePiId = req.body.overagePiId ?? null;
+    if (status === 'approved' && lockedSum > 0) {
+      const depositMsgForCheck = await Message.findOne({
+        site:       siteId,
+        contractor: req.userId,
+        type:       'payment',
+        status:     'deposited',
+      }).lean();
+      const depositHeld = depositMsgForCheck?.min_deposit ?? 0;
+      const overageAmt  = parseFloat((lockedSum - depositHeld).toFixed(2));
+
+      if (overageAmt > 0 && !overagePiId) {
+        const pi = await stripe.paymentIntents.create({
+          amount:                    Math.round(overageAmt * 100),
+          currency:                  'usd',
+          automatic_payment_methods: { enabled: true },
+          description:               `TradeLink — Work overage for ${pendingMsg.tradePro.professionality}`,
+          metadata:                  { siteId: String(siteId), contractorId: String(req.userId) },
+        });
+        console.log(`[updatePaymentApproval] ⚠️ overage detected: lockedSum=$${lockedSum} depositHeld=$${depositHeld} overage=$${overageAmt} — created PI ${pi.id}`);
+        return res.status(402).json({
+          needsOverage:  true,
+          overageAmount: overageAmt,
+          clientSecret:  pi.client_secret,
+          piId:          pi.id,
+        });
+      }
+    }
 
     // ── REJECTION ────────────────────────────────────────────────────────────
     if (status === 'rejected') {
@@ -1467,12 +1600,116 @@ export async function updatePaymentApproval(req, res, next) {
         site:          siteId,
         contractor:    req.userId,
         requestedDate: pendingMsg.requestedDate,
+        order_sum:     lockedSum,
         status:        'approved',
         type:          'payment',
         senderType:    'contractor',
       }),
       Message.findByIdAndDelete(orderId),
     ]);
+
+    // ── Stripe: capture deposit hold → transfer to trade pro ─────────────────
+    const stripeAccountId = pendingMsg.tradePro?.stripeAccountId ?? null;
+    let capturedPiId = null;
+    let transferId   = null;
+
+    if (lockedSum > 0) {
+      const amountCents = Math.round(lockedSum * 100);
+
+      // Find the held deposit PI for this site
+      const depositMsg = await Message.findOne({
+        site:       siteId,
+        contractor: req.userId,
+        type:       'payment',
+        status:     'deposited',
+      }).lean();
+
+      console.log(`[updatePaymentApproval] lockedSum=$${lockedSum} amountCents=${amountCents} depositPI=${depositMsg?.stripeDepositIntentId ?? 'none'}`);
+
+      let sourceChargeId = null; // charge to use as source_transaction for transfer
+
+      if (depositMsg?.stripeDepositIntentId) {
+        try {
+          const pi = await stripe.paymentIntents.retrieve(depositMsg.stripeDepositIntentId);
+          console.log(`[updatePaymentApproval] deposit PI ${pi.id} status=${pi.status} authorizedCents=${pi.amount}`);
+
+          if (pi.status === 'requires_capture') {
+            // Capture the full authorized amount so all future approvals on this site
+            // can draw from the same charge via source_transaction without hitting
+            // the "source already fully transferred" error on the 2nd+ trade pro.
+            const captureAmt = pi.amount;
+            const captured = await stripe.paymentIntents.capture(pi.id, { amount_to_capture: captureAmt });
+            capturedPiId    = captured.id;
+            sourceChargeId  = captured.latest_charge ?? null;
+            console.log(`[updatePaymentApproval] ✅ captured full $${captureAmt / 100} from PI ${capturedPiId} — chargeId=${sourceChargeId} status=${captured.status}`);
+          } else if (pi.status === 'succeeded') {
+            capturedPiId   = pi.id;
+            sourceChargeId = pi.latest_charge ?? null;
+            console.log(`[updatePaymentApproval] PI already captured — chargeId=${sourceChargeId}, using as source_transaction`);
+          } else {
+            console.log(`[updatePaymentApproval] ⚠️ PI status=${pi.status} — cannot capture`);
+          }
+        } catch (err) {
+          console.error('[updatePaymentApproval] Stripe capture error:', err.message);
+        }
+      }
+
+      // ── Split transfer: deposit portion + overage portion ────────────────────
+      const depositHeldAmt   = depositMsg?.min_deposit ?? 0;
+      const depositTransfer  = Math.min(lockedSum, depositHeldAmt);          // from deposit charge
+      const overageTransfer  = parseFloat((lockedSum - depositTransfer).toFixed(2)); // from overage PI
+
+      if (stripeAccountId && depositTransfer > 0 && sourceChargeId) {
+        try {
+          const transfer = await stripe.transfers.create({
+            amount:             Math.round(depositTransfer * 100),
+            currency:           'usd',
+            destination:        stripeAccountId,
+            source_transaction: sourceChargeId,
+            description:        `TradeLink — ${pendingMsg.tradePro.professionality} work payment (deposit)`,
+            metadata:           { orderId: String(newOrder._id), siteId: String(siteId) },
+          });
+          transferId = transfer.id;
+          console.log(`[updatePaymentApproval] ✅ deposit transfer $${depositTransfer} → ${stripeAccountId} — transfer_id: ${transferId}`);
+        } catch (err) {
+          console.error('[updatePaymentApproval] Stripe deposit transfer error:', err.message);
+        }
+      } else if (!stripeAccountId) {
+        console.log(`[updatePaymentApproval] ⚠️ no stripeAccountId for trade pro — transfer skipped`);
+      }
+
+      // Overage transfer from the extra PI the contractor just paid
+      if (stripeAccountId && overageTransfer > 0 && overagePiId) {
+        try {
+          const overagePI      = await stripe.paymentIntents.retrieve(overagePiId);
+          const overageCharge  = overagePI.latest_charge ?? null;
+          if (overageCharge) {
+            const ovTr = await stripe.transfers.create({
+              amount:             Math.round(overageTransfer * 100),
+              currency:           'usd',
+              destination:        stripeAccountId,
+              source_transaction: overageCharge,
+              description:        `TradeLink — ${pendingMsg.tradePro.professionality} work payment (overage)`,
+              metadata:           { orderId: String(newOrder._id), siteId: String(siteId) },
+            });
+            console.log(`[updatePaymentApproval] ✅ overage transfer $${overageTransfer} → ${stripeAccountId} — transfer_id: ${ovTr.id}`);
+            if (!transferId) transferId = ovTr.id; // fallback if no deposit transfer
+          }
+        } catch (err) {
+          console.error('[updatePaymentApproval] Stripe overage transfer error:', err.message);
+        }
+      }
+
+      // Store Stripe IDs + payment status on the order
+      if (capturedPiId || transferId) {
+        await WorkHoursOrder.findByIdAndUpdate(newOrder._id, {
+          stripePaymentIntentId: capturedPiId,
+          stripeTransferId:      transferId,
+          paymentStatus:         transferId ? 'paid' : 'pending',
+          payment_sum:           transferId ? lockedSum : null,
+        });
+      }
+    }
 
     const populated = await WorkHoursOrder.findById(newOrder._id)
       .populate('trade_id', 'fullName professionality photo hourlyRate')

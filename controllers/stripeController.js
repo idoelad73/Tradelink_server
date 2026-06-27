@@ -123,6 +123,7 @@ export async function createPaymentIntent(req, res, next) {
 export async function createDepositIntent(req, res, next) {
   try {
     const { siteId, amount } = req.body;
+    console.log(`\n[createDepositIntent] siteId=${siteId} amount=${amount} contractorId=${req.userId}`);
 
     if (!siteId || !amount || amount <= 0) {
       return res.status(400).json({ message: 'siteId and amount are required' });
@@ -144,25 +145,60 @@ export async function createDepositIntent(req, res, next) {
 
     const amountCents = Math.round(amount * 100);
 
+    // Reuse an existing valid PI for this site if one exists, otherwise cancel the stale one
+    const existingMsg = await Message.findOne({
+      site:       siteId,
+      contractor: req.userId,
+      stripeDepositIntentId: { $ne: null },
+    }).lean();
+
+    if (existingMsg?.stripeDepositIntentId) {
+      try {
+        const existing = await stripe.paymentIntents.retrieve(existingMsg.stripeDepositIntentId);
+        console.log(`[createDepositIntent] found existing PI ${existing.id} status=${existing.status}`);
+        const reusable = ['requires_payment_method', 'requires_confirmation', 'requires_action'];
+        if (reusable.includes(existing.status) && existing.payment_method_types?.includes('card')) {
+          console.log(`[createDepositIntent] reusing valid PI`);
+          return res.json({ clientSecret: existing.client_secret, amount });
+        }
+        // Stale or incompatible PI — cancel it and create a fresh one
+        if (!['succeeded', 'canceled'].includes(existing.status)) {
+          await stripe.paymentIntents.cancel(existing.id);
+          console.log(`[createDepositIntent] cancelled stale PI ${existing.id}`);
+        }
+      } catch (e) {
+        console.log(`[createDepositIntent] could not retrieve existing PI: ${e.message}`);
+      }
+      // Clear old stamp so alreadyInitiated check doesn't block the new PI
+      await Message.updateMany(
+        { site: siteId, contractor: req.userId },
+        { $unset: { stripeDepositIntentId: '', depositStatus: '' } }
+      );
+    }
+
+    // Create fresh PI — use card only (compatible with capture_method: 'manual')
     const paymentIntent = await stripe.paymentIntents.create({
-      amount:   amountCents,
-      currency: 'usd',
-      customer: customerId,
-      capture_method: 'manual',
-      automatic_payment_methods: { enabled: true },
+      amount:               amountCents,
+      currency:             'usd',
+      customer:             customerId,
+      capture_method:       'manual',
+      payment_method_types: ['card'],
       metadata: {
         siteId:       String(siteId),
         contractorId: String(req.userId),
         type:         'deposit',
       },
       description: `TradeLink — Deposit hold for project ${siteId}`,
-    }, { idempotencyKey: `deposit-${req.userId}-${siteId}-${amountCents}` });
+    });
 
-    // Stamp PI ID + pending status onto all approval messages for this site
-    await Message.updateMany(
-      { site: siteId, contractor: req.userId, type: 'approval' },
+    console.log(`[createDepositIntent] PI created — id=${paymentIntent.id} status=${paymentIntent.status} amountCents=${amountCents}`);
+
+    // Stamp PI ID onto all relevant approved messages for this site
+    const stampResult = await Message.updateMany(
+      { site: siteId, contractor: req.userId, type: { $in: ['approval', 'worker_offer'] }, status: 'approved' },
       { stripeDepositIntentId: paymentIntent.id, depositStatus: 'pending' }
     );
+    console.log(`[createDepositIntent] stamped ${stampResult.modifiedCount}/${stampResult.matchedCount} messages with PI id`);
 
     res.json({ clientSecret: paymentIntent.client_secret, amount });
   } catch (err) {

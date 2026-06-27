@@ -524,7 +524,12 @@ export async function findJobs(req, res, next) {
     const ungeocoded = await Site.find({
       status: 'active',
       'location.coordinates': [0, 0],
-      tradesNeeded: { $elemMatch: { name: { $regex: new RegExp(`^${professionality}$`, 'i') }, assigned: false } },
+      tradesNeeded: {
+        $elemMatch: {
+          name: { $regex: new RegExp(`^${professionality}$`, 'i') },
+          $or: [{ assigned: false }, { workers_no: { $gt: 0 } }],
+        },
+      },
     }).select('_id address');
 
     await Promise.all(ungeocoded.map(async (s) => {
@@ -551,8 +556,8 @@ export async function findJobs(req, res, next) {
             status: 'active',
             tradesNeeded: {
               $elemMatch: {
-                name:     { $regex: new RegExp(`^${professionality}$`, 'i') },
-                assigned: false,
+                name: { $regex: new RegExp(`^${professionality}$`, 'i') },
+                $or: [{ assigned: false }, { workers_no: { $gt: 0 } }],
               },
             },
           },
@@ -581,35 +586,43 @@ export async function findJobs(req, res, next) {
     const sites = await Site.aggregate(pipeline);
     console.log(`[findJobs] pro=${req.userId} trade="${professionality}" lat=${lat} lng=${lng} dist=${meters}m → ${sites.length} site(s) found`);
 
-    const results = sites
-      .filter(site => {
-        // Hide sites the trade is already confirmed/booked on
-        if (bookedSiteIds.has(String(site._id))) return false;
+    const filtered = sites.filter(site => {
+      if (bookedSiteIds.has(String(site._id))) return false;
+      const tradeEntry = site.tradesNeeded?.find(
+        (t) => t.name.toLowerCase() === professionality.toLowerCase()
+      );
+      if (tradeEntry?.requiredDate && bookedDates.has(tradeEntry.requiredDate)) return false;
+      return true;
+    });
 
-        // Hide sites whose requiredDate clashes with a confirmed booked date
-        const tradeEntry = site.tradesNeeded?.find(
-          (t) => t.name.toLowerCase() === professionality.toLowerCase()
-        );
-        if (tradeEntry?.requiredDate && bookedDates.has(tradeEntry.requiredDate)) return false;
+    // Attach deposit status per site+trade from payment messages
+    const filteredSiteIds = filtered.map(s => s._id);
+    const depositMsgs = await Message.find({
+      site:   { $in: filteredSiteIds },
+      type:   'payment',
+      status: 'deposited',
+    }).select('site tradeName min_deposit').lean();
+    const depositMap = new Map(depositMsgs.map(m => [`${m.site}::${m.tradeName}`, m.min_deposit ?? null]));
 
-        return true;
-      })
-      .map((site) => {
-        const trade = site.tradesNeeded.find(
-          (t) => t.name.toLowerCase() === professionality.toLowerCase() && !t.assigned
-        );
-        return {
-          _id:            site._id,
-          name:           site.name,
-          address:        site.address,
-          type:           site.type,
-          photo:          site.photo,
-          distanceMeters: site.distanceMeters,
-          tradeEntry:     trade || null,
-          contractorId:   site.contractorInfo?._id || null,
-          contractorName: site.contractorInfo?.companyName || null,
-        };
-      });
+    const results = filtered.map((site) => {
+      const trade = site.tradesNeeded.find(
+        (t) => t.name.toLowerCase() === professionality.toLowerCase() && (!t.assigned || t.workers_no > 0)
+      );
+      const depositKey    = trade ? `${site._id}::${trade.name}` : null;
+      const depositHeld   = depositKey ? depositMap.has(depositKey) : false;
+      const depositAmount = depositKey ? (depositMap.get(depositKey) ?? null) : null;
+      return {
+        _id:            site._id,
+        name:           site.name,
+        address:        site.address,
+        type:           site.type,
+        photo:          site.photo,
+        distanceMeters: site.distanceMeters,
+        tradeEntry:     trade ? { ...trade, depositHeld, depositAmount } : null,
+        contractorId:   site.contractorInfo?._id || null,
+        contractorName: site.contractorInfo?.companyName || null,
+      };
+    });
 
     res.json({ results, professionality, hourlyRate: pro.hourlyRate ?? null });
   } catch (err) {

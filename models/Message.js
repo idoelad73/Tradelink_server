@@ -25,6 +25,7 @@ const messageSchema = new Schema(
     tradeName:      { type: String,  default: '' }, // e.g. 'Painter' — which trade slot this fills
     workersOffered: { type: Number,  default: 1  }, // how many workers this TradePro is offering
     min_deposit:    { type: Number,  default: null }, // workersOffered × hourlyRate × totalHours (set on approval)
+    order_sum:      { type: Number,  default: null }, // locked sum approved by contractor (actual_hours × rate × workers)
     stripeDepositIntentId: { type: String, default: null },
     depositStatus: {
       type:    String,
@@ -34,7 +35,7 @@ const messageSchema = new Schema(
 
     status: {
       type:    String,
-      enum:    ['pending', 'approved', 'accepted', 'rejected'],
+      enum:    ['pending', 'approved', 'accepted', 'rejected', 'deposited'],
       default: 'pending',
     },
     type: {
