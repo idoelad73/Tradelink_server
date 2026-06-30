@@ -20,9 +20,17 @@ const contractorSchema = new Schema(
     lastLogin:   { type: Date,    default: null  },
     loginCount:  { type: Number,  default: 0     },
 
+    // ── Ratings (from trade pros grading this contractor) ────
+    avgGrade:   { type: Number, default: null },
+    gradeCount: { type: Number, default: 0    },
+
     // ── Stripe — store only Stripe IDs, never raw card data ──
     stripeCustomerId:            { type: String, default: null },
-    stripeDefaultPaymentMethod:  { type: String, default: null }, // saved from last deposit for off-session overage charges
+    stripeDefaultPaymentMethod:  { type: String, default: null },
+
+    // ── Password reset ────────────────────────────────────
+    passwordResetTokenHash: { type: String, default: null, select: false },
+    passwordResetExpiresAt: { type: Date,   default: null },
   },
   { timestamps: true }
 );

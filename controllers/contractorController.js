@@ -30,7 +30,6 @@ import Message from '../models/Message.js';
 import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
-import { sendMail } from '../utils/mailer.js';
 import jwt from 'jsonwebtoken';
 import stripe from '../utils/stripe.js';
 
@@ -245,10 +244,7 @@ export async function askAvailability(req, res, next) {
       }
     }
 
-    const [pro, contractor] = await Promise.all([
-      TradePro.findById(req.params.tradeId).select('fullName email professionality photo'),
-      Contractor.findById(req.userId).select('companyName'),
-    ]);
+    const pro = await TradePro.findById(req.params.tradeId).select('fullName email professionality photo');
     if (!pro) return res.status(404).json({ message: 'Trade professional not found' });
 
     // Duplicate check — same contractor + trade pro + site + date
@@ -268,89 +264,6 @@ export async function askAvailability(req, res, next) {
         });
       }
     }
-
-    const locale      = lang === 'es' ? 'es-ES' : 'en-US';
-    const displayDate = new Date(date + 'T12:00:00').toLocaleDateString(locale, {
-      year: 'numeric', month: 'long', day: 'numeric',
-    });
-    const companyName = contractor?.companyName || (lang === 'es' ? 'Un contratista' : 'A contractor');
-
-    const copy = lang === 'es' ? {
-      header:   'Solicitud de Disponibilidad',
-      greeting: `Estimado/a <strong>${pro.fullName}</strong>`,
-      body:     `Nos comunicamos desde <strong>${companyName}</strong> a través de TradeLink. Estamos interesados en sus servicios de <strong>${pro.professionality}</strong> y quisiéramos saber si está disponible el:`,
-      siteLabel:'Obra',
-      follow:   'Si está disponible en esa fecha, por favor contáctenos para coordinar los detalles del trabajo. Esperamos su respuesta.',
-      regards:  'Saludos cordiales',
-      footer:   'Este mensaje fue enviado a través de la plataforma TradeLink. Por favor no responda a este correo automático.',
-    } : {
-      header:   'Availability Request',
-      greeting: `Dear <strong>${pro.fullName}</strong>`,
-      body:     `We are reaching out from <strong>${companyName}</strong> via TradeLink. We are interested in your <strong>${pro.professionality}</strong> services and would like to know if you are available on:`,
-      siteLabel:'Site',
-      follow:   'If you are available on this date, please get in touch with us so we can discuss the details of the work required. We look forward to hearing from you.',
-      regards:  'Best regards',
-      footer:   'This message was sent through the TradeLink platform. Please do not reply to this automated email.',
-    };
-
-    const subject = lang === 'es'
-      ? `Solicitud de disponibilidad para el ${displayDate} — ${companyName}`
-      : `Availability Request for ${displayDate} — ${companyName}`;
-
-    const html = `
-      <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#f8fafc;padding:32px;border-radius:16px;">
-        <div style="background:linear-gradient(135deg,#0ea5e9,#f59e0b);border-radius:12px;padding:24px;text-align:center;margin-bottom:24px;">
-          <h1 style="color:#fff;margin:0;font-size:22px;font-weight:800;letter-spacing:-0.5px;">TradeLink</h1>
-          <p style="color:rgba(255,255,255,0.85);margin:6px 0 0;font-size:13px;">${copy.header}</p>
-        </div>
-        <div style="background:#fff;border-radius:12px;padding:28px;border:1px solid #e2e8f0;">
-          <p style="color:#334155;font-size:15px;margin:0 0 16px;">${copy.greeting},</p>
-          <p style="color:#475569;font-size:14px;line-height:1.7;margin:0 0 16px;">${copy.body}</p>
-          <div style="background:#f0f9ff;border:2px solid #0ea5e9;border-radius:10px;padding:16px;text-align:center;margin:20px 0;">
-            <p style="margin:0;font-size:20px;font-weight:800;color:#0369a1;">📅 ${displayDate}</p>
-            ${siteName ? `<p style="margin:6px 0 0;font-size:13px;color:#64748b;">${copy.siteLabel}: <strong>${siteName}</strong></p>` : ''}
-          </div>
-          <p style="color:#475569;font-size:14px;line-height:1.7;margin:0 0 16px;">${copy.follow}</p>
-          <p style="color:#475569;font-size:14px;margin:0;">
-            ${copy.regards},<br/>
-            <strong>${companyName}</strong><br/>
-            <span style="color:#94a3b8;font-size:12px;">via TradeLink</span>
-          </p>
-        </div>
-        <p style="text-align:center;color:#94a3b8;font-size:11px;margin-top:20px;">${copy.footer}</p>
-      </div>
-    `;
-
-    // Signed token for the one-click approve button (valid 7 days)
-    const bookingToken = jwt.sign(
-      { tradeId: pro._id.toString(), date, siteName: siteName || '', siteAddress,
-        siteId: siteId || null, tradeName: tradeName || '', workersOffered: 1 },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-    const serverUrl  = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3000}`;
-    const approveUrl = `${serverUrl}/api/trade/approve-booking?token=${bookingToken}`;
-
-    const approveBtn = lang === 'es'
-      ? `<div style="text-align:center;margin:24px 0">
-           <a href="${approveUrl}" style="display:inline-block;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:15px;font-weight:800;padding:14px 32px;border-radius:12px;text-decoration:none;letter-spacing:-.2px">
-             ✅ Aprobado para el trabajo
-           </a>
-           <p style="color:#94a3b8;font-size:11px;margin-top:10px">Este enlace es válido por 7 días</p>
-         </div>`
-      : `<div style="text-align:center;margin:24px 0">
-           <a href="${approveUrl}" style="display:inline-block;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:15px;font-weight:800;padding:14px 32px;border-radius:12px;text-decoration:none;letter-spacing:-.2px">
-             ✅ Approved for the Job
-           </a>
-           <p style="color:#94a3b8;font-size:11px;margin-top:10px">This link is valid for 7 days</p>
-         </div>`;
-
-    const htmlWithBtn = html.replace(
-      '<p style="text-align:center;color:#94a3b8',
-      approveBtn + '<p style="text-align:center;color:#94a3b8'
-    );
-
-    await sendMail({ to: pro.email, subject, html: htmlWithBtn });
 
     // Create message record + increment counter
     if (siteId) {
@@ -494,38 +407,6 @@ export async function requestWorkPlanDate(req, res, next) {
     const displayDate = new Date(requiredDate + 'T12:00:00').toLocaleDateString(locale, {
       year: 'numeric', month: 'long', day: 'numeric',
     });
-
-    const serverUrl    = process.env.SERVER_URL || `http://localhost:${process.env.PORT || 3000}`;
-    const bookingToken = jwt.sign(
-      { tradeId: String(pro._id), date: requiredDate, siteName: site.name, siteAddress: site.address,
-        siteId: String(req.params.id), tradeName, workersOffered: tradeEntry?.workers_no ?? 1 },
-      process.env.JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-    const approveUrl = `${serverUrl}/api/trade/approve-booking?token=${bookingToken}`;
-
-    const subject = lang === 'es'
-      ? `Nueva fecha solicitada para ${site.name} — ${companyName}`
-      : `Schedule update request for ${site.name} — ${companyName}`;
-
-    const html = `
-      <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;background:#f8fafc;padding:32px;border-radius:16px;">
-        <h1 style="color:#0ea5e9;font-size:22px;font-weight:800">TradeLink</h1>
-        <p style="color:#0f172a">Dear <strong>${pro.fullName}</strong>,</p>
-        <p style="color:#475569"><strong>${companyName}</strong> has requested a schedule update for <strong>${site.name}</strong>.</p>
-        <p style="color:#0f172a;font-size:18px;font-weight:700">📅 ${displayDate}</p>
-        <div style="text-align:center;margin:24px 0">
-          <a href="${approveUrl}" style="display:inline-block;background:linear-gradient(135deg,#22c55e,#16a34a);color:#fff;font-size:15px;font-weight:800;padding:14px 32px;border-radius:12px;text-decoration:none">
-            ✅ Confirm New Date
-          </a>
-          <p style="color:#94a3b8;font-size:11px;margin-top:10px">This link is valid for 7 days</p>
-        </div>
-        <p style="color:#94a3b8;font-size:11px">Sent via TradeLink</p>
-      </div>`;
-
-    if (pro.email) {
-      await sendMail({ to: pro.email, subject, html });
-    }
 
     await Message.create({
       tradePro:      pro._id,
@@ -868,57 +749,6 @@ export async function approveApplication(req, res, next) {
     });
     await TradePro.findByIdAndUpdate(app.tradePro._id, { $inc: { availabilityMessages: 1 } });
 
-    // Send approval email to the trade pro
-    if (app.tradePro.email) {
-      const displayDate = finalDate
-        ? new Date(finalDate + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
-        : null;
-
-      const subject = `🎉 Your application for "${app.site.name}" was approved — TradeLink`;
-      const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${subject}</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
-</head><body>
-<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
-  <div style="background:linear-gradient(135deg,#22c55e,#0ea5e9);padding:28px;text-align:center">
-    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
-    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">Job Application Approved</p>
-  </div>
-  <div style="padding:32px">
-    <div style="font-size:48px;text-align:center;margin-bottom:16px">🎉</div>
-    <h2 style="color:#0f172a;font-size:20px;font-weight:800;text-align:center;margin-bottom:8px">Congratulations, ${app.tradePro.fullName}!</h2>
-    <p style="color:#475569;font-size:14px;line-height:1.7;text-align:center;margin-bottom:28px">
-      <strong>${companyName}</strong> has approved your application for the project below.
-    </p>
-
-    <div style="background:#f0fdf4;border:2px solid #86efac;border-radius:14px;padding:20px;margin-bottom:24px">
-      <p style="color:#166534;font-size:16px;font-weight:800;margin-bottom:4px">🏗️ ${app.site.name}</p>
-      <p style="color:#64748b;font-size:13px;margin-bottom:${displayDate ? '12px' : '0'}">📍 ${app.site.address}</p>
-      ${displayDate ? `<div style="background:#fff;border:1.5px solid #86efac;border-radius:10px;padding:12px;text-align:center;margin-top:4px">
-        <p style="color:#166534;font-size:15px;font-weight:800">📅 ${displayDate}</p>
-      </div>` : ''}
-    </div>
-
-    <div style="background:#fefce8;border:1.5px solid #fde68a;border-radius:12px;padding:14px;margin-bottom:28px;text-align:center">
-      <p style="color:#92400e;font-size:13px;font-weight:700">✅ Approved by ${companyName}</p>
-      <p style="color:#78350f;font-size:12px;margin-top:4px">Log in to TradeLink to view the full details and confirm your schedule.</p>
-    </div>
-
-    <p style="color:#94a3b8;font-size:12px;text-align:center;line-height:1.6">
-      This notification was sent through TradeLink. Please do not reply to this automated email.
-    </p>
-  </div>
-  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
-    <p style="color:#94a3b8;font-size:11px">TradeLink · Connecting trade professionals with projects</p>
-  </div>
-</div>
-</body></html>`;
-
-      await sendMail({ to: app.tradePro.email, subject, html });
-      console.log(`[approveApplication] Approval email sent to ${app.tradePro.email}`);
-    }
-
     // Check messages collection: find any other pending applications from the
     // same trade pro on the same date so the client can gray them out immediately
     const siblingApplicationIds = finalDate
@@ -1039,57 +869,6 @@ export async function approveAvailabilityRequest(req, res, next) {
       senderType:     'contractor',
     });
     await TradePro.findByIdAndUpdate(msg.tradePro._id, { $inc: { availabilityMessages: 1 } });
-
-    // 5. Send approval email to the trade pro
-    const contractor = await Contractor.findById(req.userId).select('companyName');
-    const companyName = contractor?.companyName || 'Your contractor';
-
-    if (msg.tradePro.email) {
-      const displayDate = finalDate
-        ? new Date(finalDate + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
-        : null;
-
-      const subject = `🎉 Your availability for "${msg.site.name}" was approved — TradeLink`;
-      const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${subject}</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
-</head><body>
-<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
-  <div style="background:linear-gradient(135deg,#22c55e,#0ea5e9);padding:28px;text-align:center">
-    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
-    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">Availability Approved</p>
-  </div>
-  <div style="padding:32px">
-    <div style="font-size:48px;text-align:center;margin-bottom:16px">🎉</div>
-    <h2 style="color:#0f172a;font-size:20px;font-weight:800;text-align:center;margin-bottom:8px">You're booked, ${msg.tradePro.fullName}!</h2>
-    <p style="color:#475569;font-size:14px;line-height:1.7;text-align:center;margin-bottom:28px">
-      <strong>${companyName}</strong> has confirmed your availability for the project below.
-    </p>
-    <div style="background:#f0fdf4;border:2px solid #86efac;border-radius:14px;padding:20px;margin-bottom:24px">
-      <p style="color:#166534;font-size:16px;font-weight:800;margin-bottom:4px">🏗️ ${msg.site.name}</p>
-      <p style="color:#64748b;font-size:13px;margin-bottom:${displayDate ? '12px' : '0'}">📍 ${msg.site.address}</p>
-      ${displayDate ? `<div style="background:#fff;border:1.5px solid #86efac;border-radius:10px;padding:12px;text-align:center;margin-top:4px">
-        <p style="color:#166534;font-size:15px;font-weight:800">📅 ${displayDate}</p>
-      </div>` : ''}
-    </div>
-    <div style="background:#fefce8;border:1.5px solid #fde68a;border-radius:12px;padding:14px;margin-bottom:28px;text-align:center">
-      <p style="color:#92400e;font-size:13px;font-weight:700">✅ Confirmed by ${companyName}</p>
-      <p style="color:#78350f;font-size:12px;margin-top:4px">Log in to TradeLink to view the full details and your schedule.</p>
-    </div>
-    <p style="color:#94a3b8;font-size:12px;text-align:center;line-height:1.6">
-      This notification was sent through TradeLink. Please do not reply to this automated email.
-    </p>
-  </div>
-  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
-    <p style="color:#94a3b8;font-size:11px">TradeLink · Connecting trade professionals with projects</p>
-  </div>
-</div>
-</body></html>`;
-
-      await sendMail({ to: msg.tradePro.email, subject, html });
-      console.log(`[approveAvailabilityRequest] Approval email sent to ${msg.tradePro.email}`);
-    }
 
     res.json({ ok: true, slotsRemaining: newWorkersCount, siteId: String(msg.site._id) });
   } catch (err) {
@@ -1432,6 +1211,8 @@ export async function findTrades(req, res, next) {
 
     // Strip location from response (internal use only)
     const sanitised = results.map(({ location: _loc, ...rest }) => rest);
+    // Sort by avgGrade descending — 5-star pros appear first
+    sanitised.sort((a, b) => (b.avgGrade ?? 0) - (a.avgGrade ?? 0));
     res.json({ results: sanitised, total: sanitised.length, requiredDate });
   } catch (err) {
     next(err);
@@ -1812,8 +1593,8 @@ export async function getGradableTrades(req, res, next) {
     // Only keep orders where both trade and site are still populated
     const valid = orders.filter(o => o.trade_id && o.site_id);
 
-    // Remove orders that have already been graded (keyed by order_id)
-    const existing = await TradeGrade.find({ contractor_id: contractorId }).select('order_id').lean();
+    // Remove orders that have already been graded as 'trade' type (keyed by order_id)
+    const existing = await TradeGrade.find({ contractor_id: contractorId, grade_type: 'trade' }).select('order_id').lean();
     const gradedOrderIds = new Set(existing.map(g => String(g.order_id)));
 
     const gradable = valid
@@ -1863,6 +1644,7 @@ export async function submitTradeGrade(req, res, next) {
       { contractor_id: req.userId, order_id },
       {
         trade_id, site_id: site_id || null, order_id,
+        grade_type: 'trade',
         trade_grade: grade, grade_name: GRADE_NAMES_MAP[grade],
         review_text: (review_text ?? '').trim(),
         photos: photoUrls,
@@ -1887,6 +1669,50 @@ export async function submitTradeGrade(req, res, next) {
     res.status(201).json({ grade: doc, avgGrade: agg?.avg ?? grade, gradeCount: agg?.count ?? 1 });
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ message: 'Already graded.' });
+    next(err);
+  }
+}
+
+// ── GET /contractor/trade-grades/:tradeId/reviews ─────────────────────────────
+// Returns all reviews (text + photos) for a specific trade pro, newest first.
+// Uses the { trade_id: 1, createdAt: -1 } index for fast lookup.
+export async function getTradeReviews(req, res, next) {
+  try {
+    const { tradeId } = req.params;
+
+    const [pro, reviews] = await Promise.all([
+      TradePro.findById(tradeId).select('fullName professionality photo avgGrade gradeCount').lean(),
+      TradeGrade.find({ trade_id: tradeId })
+        .sort({ createdAt: -1 })
+        .populate('contractor_id', 'companyName')
+        .populate('site_id', 'name')
+        .lean(),
+    ]);
+
+    if (!pro) return res.status(404).json({ message: 'Trade pro not found.' });
+
+    res.json({
+      pro: {
+        _id:           String(pro._id),
+        fullName:      pro.fullName,
+        professionality: pro.professionality,
+        photo:         pro.photo ?? null,
+        avgGrade:      pro.avgGrade ?? null,
+        gradeCount:    pro.gradeCount ?? 0,
+      },
+      reviews: reviews.map(r => ({
+        _id:          String(r._id),
+        trade_grade:  r.trade_grade,
+        grade_name:   r.grade_name,
+        review_text:  r.review_text ?? '',
+        photos:       r.photos ?? [],
+        date:         r.date,
+        createdAt:    r.createdAt,
+        contractorName: r.contractor_id?.companyName ?? 'Anonymous',
+        siteName:       r.site_id?.name ?? null,
+      })),
+    });
+  } catch (err) {
     next(err);
   }
 }

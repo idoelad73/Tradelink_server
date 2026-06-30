@@ -1,9 +1,12 @@
+import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
+import bcrypt from 'bcrypt';
 import mongoose from 'mongoose';
 import TradePro from '../models/TradePro.js';
 import Contractor from '../models/Contractor.js';
 import { uploadPhoto, uploadDocument } from '../utils/cloudinary.js';
 import stripe from '../utils/stripe.js';
+import { sendMail } from '../utils/mailer.js';
 
 // Force BSON Double so MongoDB stores as Float64, not Int32
 const toDouble = (v) => new mongoose.mongo.Double(parseFloat(v));
@@ -331,6 +334,122 @@ export async function registerContractor(req, res, next) {
     });
 
     sendToken(user, 'contractor', 201, res);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/auth/forgot-password ────────────────────────────────────────────
+export async function forgotPassword(req, res, next) {
+  const GENERIC = { message: "If an account with that email exists, we've sent a password reset link." };
+  try {
+    const email = String(req.body.email || '').toLowerCase().trim();
+    if (!email) return res.status(400).json({ message: 'Email is required.' });
+
+    // Search both collections — never reveal which (or whether) an account exists
+    let user  = await TradePro.findOne({ email });
+    let Model = TradePro;
+    if (!user) {
+      user  = await Contractor.findOne({ email });
+      Model = Contractor;
+    }
+
+    if (!user) return res.status(200).json(GENERIC);
+
+    const rawToken  = crypto.randomBytes(32).toString('hex');
+    const tokenHash = crypto.createHash('sha256').update(rawToken).digest('hex');
+
+    await Model.findByIdAndUpdate(user._id, {
+      passwordResetTokenHash: tokenHash,
+      passwordResetExpiresAt: new Date(Date.now() + 30 * 60 * 1000), // 30 min
+    });
+
+    const clientUrl = process.env.CLIENT_URL || 'http://localhost:5173';
+    const resetLink = `${clientUrl}/reset-password?token=${rawToken}`;
+    const name      = user.fullName || user.companyName || 'User';
+
+    const subject = 'TradeLink — Reset Your Password';
+    const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${subject}</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
+</head><body>
+<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
+  <div style="background:linear-gradient(135deg,#22c55e,#0ea5e9);padding:28px;text-align:center">
+    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
+    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">Password Reset Request</p>
+  </div>
+  <div style="padding:32px">
+    <p style="color:#0f172a;font-size:15px;margin-bottom:6px">Hi <strong>${name}</strong>,</p>
+    <p style="color:#475569;font-size:14px;line-height:1.6;margin-bottom:28px">
+      We received a request to reset your TradeLink password. Click the button below to choose a new password.
+      This link expires in <strong>30 minutes</strong>.
+    </p>
+
+    <div style="text-align:center;margin-bottom:28px">
+      <a href="${resetLink}"
+         style="display:inline-block;background:linear-gradient(135deg,#22c55e,#0ea5e9);color:#fff;font-weight:700;font-size:15px;padding:14px 32px;border-radius:12px;text-decoration:none;letter-spacing:-.2px">
+        Reset My Password
+      </a>
+    </div>
+
+    <p style="color:#64748b;font-size:12px;line-height:1.6;margin-bottom:8px">
+      If the button doesn't work, copy and paste this link into your browser:
+    </p>
+    <p style="word-break:break-all;color:#0ea5e9;font-size:12px;margin-bottom:24px">${resetLink}</p>
+
+    <p style="color:#94a3b8;font-size:12px;line-height:1.6">
+      If you didn't request a password reset, you can safely ignore this email — your password will not change.
+    </p>
+  </div>
+  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
+    <p style="color:#94a3b8;font-size:11px">TradeLink · Connecting trade professionals with projects</p>
+  </div>
+</div>
+</body></html>`;
+
+    await sendMail({ to: user.email, subject, html });
+
+    return res.status(200).json(GENERIC);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/auth/reset-password ─────────────────────────────────────────────
+export async function resetPassword(req, res, next) {
+  try {
+    const { token, password } = req.body;
+    if (!token || !password) {
+      return res.status(400).json({ message: 'Token and new password are required.' });
+    }
+    if (password.length < 8) {
+      return res.status(400).json({ message: 'Password must be at least 8 characters.' });
+    }
+
+    const tokenHash = crypto.createHash('sha256').update(String(token)).digest('hex');
+    const now       = new Date();
+
+    // Search both collections for a valid (non-expired) matching hash
+    let user  = await TradePro.findOne({ passwordResetTokenHash: tokenHash, passwordResetExpiresAt: { $gt: now } });
+    let Model = TradePro;
+    if (!user) {
+      user  = await Contractor.findOne({ passwordResetTokenHash: tokenHash, passwordResetExpiresAt: { $gt: now } });
+      Model = Contractor;
+    }
+
+    if (!user) {
+      return res.status(400).json({ message: 'Reset link is invalid or has expired.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 12);
+    await Model.findByIdAndUpdate(user._id, {
+      password:               hashedPassword,
+      passwordResetTokenHash: null,
+      passwordResetExpiresAt: null,
+    });
+
+    return res.status(200).json({ message: 'Password reset successfully. You can now log in.' });
   } catch (err) {
     next(err);
   }

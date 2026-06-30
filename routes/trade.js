@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { protect, restrictTo } from '../middleware/auth.js';
 import { photoUpload, handleUploadError } from '../middleware/upload.js';
-import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking, getApprovedOrderDates, checkWorkLog, submitWorkLog, getPaymentApprovedCount, getPaymentApproved } from '../controllers/tradeController.js';
+import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking, getApprovedOrderDates, checkWorkLog, submitWorkLog, getPaymentApprovedCount, getPaymentApproved, getGradableContractors, uploadContractorGradePhoto, submitContractorGrade, getContractorReviews } from '../controllers/tradeController.js';
 import { createOnboardingLink, completeOnboarding, getStripeStatus } from '../controllers/tradeStripeController.js';
 
 const router = Router();
@@ -27,6 +27,14 @@ router.get('/work-log/check',   checkWorkLog);
 router.post('/work-log',      submitWorkLog);
 router.get('/payment-approved/count', getPaymentApprovedCount);
 router.get('/payment-approved',       getPaymentApproved);
+
+// ── Contractor grading (by trade pros) ──────────────────────────────────────
+import multer from 'multer';
+const gradeUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 }, fileFilter: (_r, f, cb) => cb(null, f.mimetype.startsWith('image/')) });
+router.get ('/contractor-grades/eligible',              getGradableContractors);
+router.post('/contractor-grades/photo',                gradeUpload.single('photo'), uploadContractorGradePhoto);
+router.post('/contractor-grades',                      submitContractorGrade);
+router.get ('/contractor-grades/:contractorId/reviews', getContractorReviews);
 
 // ── Stripe Connect onboarding ────────────────────────────────────────────────
 router.get ('/stripe/status',            getStripeStatus);

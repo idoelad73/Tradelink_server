@@ -70,6 +70,7 @@ const workHoursOrderSchema = new Schema(
     // Set when payment succeeds (webhook):
     payment_sum: { type: Number, default: null }, // amount TradePro receives (order_sum - fee)
     fee_sum:     { type: Number, default: null }, // platform commission amount
+    receiptSent: { type: Boolean, default: false }, // true once receipt email sent to contractor
   },
   { timestamps: true, collection: 'tradehours_orders' }
 );

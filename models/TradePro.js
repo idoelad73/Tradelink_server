@@ -55,6 +55,10 @@ const tradeProSchema = new Schema(
     lastLogin:            { type: Date,    default: null  },
     loginCount:           { type: Number,  default: 0     },
     availabilityMessages: { type: Number,  default: 0     },
+
+    // ── Password reset ────────────────────────────────────
+    passwordResetTokenHash: { type: String, default: null, select: false },
+    passwordResetExpiresAt: { type: Date,   default: null },
   },
   { timestamps: true }
 );

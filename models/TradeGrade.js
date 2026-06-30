@@ -8,6 +8,7 @@ const tradeGradeSchema = new mongoose.Schema(
     contractor_id: { type: mongoose.Schema.Types.ObjectId, ref: 'Contractor',    required: true },
     site_id:       { type: mongoose.Schema.Types.ObjectId, ref: 'Site',          default: null  },
     order_id:      { type: mongoose.Schema.Types.ObjectId, ref: 'WorkHoursOrder',default: null  },
+    grade_type:    { type: String, enum: ['trade', 'contractor'], default: 'trade' },
     trade_grade:   { type: Number, min: 1, max: 5, required: true },
     grade_name:    { type: String, required: true },   // 'Poor' … 'Excellent'
     review_text:   { type: String, default: '' },
@@ -19,6 +20,8 @@ const tradeGradeSchema = new mongoose.Schema(
 
 // One grade per contractor × order (each WorkHoursOrder is independently gradable)
 tradeGradeSchema.index({ contractor_id: 1, order_id: 1 }, { unique: true, sparse: true });
+// Fast lookup of all reviews for a given trade pro
+tradeGradeSchema.index({ trade_id: 1, createdAt: -1 });
 
 // Auto-set grade_name before save
 tradeGradeSchema.pre('save', function (next) {

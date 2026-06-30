@@ -4,10 +4,10 @@ import Contractor from '../models/Contractor.js';
 import Message from '../models/Message.js';
 import Site from '../models/Site.js';
 import WorkHoursOrder from '../models/WorkHoursOrder.js';
+import TradeGrade, { GRADE_NAMES_MAP } from '../models/TradeGrade.js';
 import jwt from 'jsonwebtoken';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
-import { sendMail } from '../utils/mailer.js';
 
 // Force BSON Double so MongoDB stores as Float64, not Int32
 const toDouble = (v) => new mongoose.mongo.Double(parseFloat(v));
@@ -580,6 +580,8 @@ export async function findJobs(req, res, next) {
           tradesNeeded: 1, distanceMeters: 1,
           'contractorInfo._id': 1,
           'contractorInfo.companyName': 1,
+          'contractorInfo.avgGrade': 1,
+          'contractorInfo.gradeCount': 1,
         },
       },
     ];
@@ -620,10 +622,15 @@ export async function findJobs(req, res, next) {
         photo:          site.photo,
         distanceMeters: site.distanceMeters,
         tradeEntry:     trade ? { ...trade, depositHeld, depositAmount } : null,
-        contractorId:   site.contractorInfo?._id || null,
-        contractorName: site.contractorInfo?.companyName || null,
+        contractorId:         site.contractorInfo?._id || null,
+        contractorName:       site.contractorInfo?.companyName || null,
+        contractorAvgGrade:   site.contractorInfo?.avgGrade  ?? null,
+        contractorGradeCount: site.contractorInfo?.gradeCount ?? 0,
       };
     });
+
+    // Sort by contractor avgGrade descending — highest-rated contractors first
+    results.sort((a, b) => (b.contractorAvgGrade ?? 0) - (a.contractorAvgGrade ?? 0));
 
     res.json({ results, professionality, hourlyRate: pro.hourlyRate ?? null });
   } catch (err) {
@@ -709,73 +716,6 @@ export async function applyToJob(req, res, next) {
     const locale      = lang === 'es' ? 'es-ES' : 'en-US';
     const contractorEmail = site.contractor?.email;
     const companyName     = site.contractor?.companyName || 'Contractor';
-
-    if (contractorEmail) {
-      const subject = lang === 'es'
-        ? `Nuevo interesado en "${site.name}" — TradeLink`
-        : `New applicant for "${site.name}" — TradeLink`;
-
-      const locale = lang === 'es' ? 'es-ES' : 'en-US';
-    const rateLine = pro.hourlyRate
-        ? `<p style="margin:4px 0;color:#475569;font-size:14px">💰 $${pro.hourlyRate}/hr</p>`
-        : '';
-    const dateLine = date
-        ? `<p style="margin:4px 0;color:#0369a1;font-size:14px;font-weight:700">📅 ${new Date(date + 'T12:00:00').toLocaleDateString(locale, { weekday:'long', year:'numeric', month:'long', day:'numeric' })}</p>`
-        : '';
-
-      const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${subject}</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
-</head><body>
-<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
-  <div style="background:linear-gradient(135deg,#f59e0b,#0ea5e9);padding:28px;text-align:center">
-    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
-    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">${lang === 'es' ? 'Nueva solicitud de trabajo' : 'New Job Application'}</p>
-  </div>
-  <div style="padding:32px">
-    <p style="color:#0f172a;font-size:15px;margin-bottom:20px">
-      ${lang === 'es' ? `Hola <strong>${companyName}</strong>,` : `Hi <strong>${companyName}</strong>,`}
-    </p>
-    <p style="color:#475569;font-size:14px;line-height:1.6;margin-bottom:24px">
-      ${lang === 'es'
-        ? `Un profesional está interesado en trabajar en tu proyecto <strong>"${site.name}"</strong> en TradeLink.`
-        : `A trade professional has expressed interest in working on your project <strong>"${site.name}"</strong> on TradeLink.`}
-    </p>
-
-    <div style="background:#f0f9ff;border:2px solid #0ea5e9;border-radius:14px;padding:20px;margin-bottom:24px;display:flex;align-items:center;gap:16px">
-      ${pro.photo
-        ? `<img src="${pro.photo}" alt="${pro.fullName}" style="width:56px;height:56px;border-radius:12px;object-fit:cover;flex-shrink:0;border:2px solid #bae6fd">`
-        : `<div style="width:56px;height:56px;border-radius:12px;background:#e0f2fe;display:flex;align-items:center;justify-content:center;font-size:24px;flex-shrink:0">🔧</div>`}
-      <div>
-        <p style="color:#0f172a;font-size:16px;font-weight:800;margin-bottom:2px">${pro.fullName}</p>
-        <p style="color:#0369a1;font-size:13px;font-weight:600">🏗️ ${pro.professionality}</p>
-        ${rateLine}
-        ${dateLine}
-      </div>
-    </div>
-
-    <div style="background:#fefce8;border:1.5px solid #fde68a;border-radius:12px;padding:14px;margin-bottom:28px">
-      <p style="color:#92400e;font-size:13px;font-weight:700;margin-bottom:4px">📍 ${lang === 'es' ? 'Tu proyecto' : 'Your project'}</p>
-      <p style="color:#0f172a;font-size:15px;font-weight:800">${site.name}</p>
-      <p style="color:#64748b;font-size:13px;margin-top:2px">${site.address}</p>
-    </div>
-
-    <p style="color:#94a3b8;font-size:12px;text-align:center;line-height:1.6">
-      ${lang === 'es'
-        ? 'Inicia sesión en TradeLink para ver el perfil completo del profesional y contactarlo.'
-        : 'Log in to TradeLink to view the full professional profile and get in touch.'}
-    </p>
-  </div>
-  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
-    <p style="color:#94a3b8;font-size:11px">TradeLink · ${lang === 'es' ? 'Conectando profesionales con proyectos' : 'Connecting trade professionals with projects'}</p>
-  </div>
-</div>
-</body></html>`;
-
-      await sendMail({ to: contractorEmail, subject, html });
-      console.log(`[applyToJob] Email sent to ${contractorEmail} for site "${site.name}" from ${pro.fullName}`);
-    }
 
     res.json({ ok: true, siteName: site.name, contractorName: companyName });
   } catch (err) {
@@ -962,6 +902,152 @@ export async function getPaymentApproved(req, res, next) {
 
     res.json({ orders, rejected, pending });
   } catch (err) {
+    next(err);
+  }
+}
+
+// ── GET /trade/contractor-grades/eligible ─────────────────────────────────────
+// Returns all contractors this trade pro has approved/paid orders with but
+// hasn't graded yet. Uses the { trade_id: 1, createdAt: -1 } index on orders.
+export async function getGradableContractors(req, res, next) {
+  try {
+    // All orders for this trade pro that are approved
+    const orders = await WorkHoursOrder.find({
+      trade_id: req.userId,
+      status:   'approved',
+    })
+      .populate('contractor_id', 'companyName email address')
+      .populate('site_id', 'name')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Grades already submitted by this trade pro for contractors
+    const submitted = await TradeGrade.find({
+      trade_id:   req.userId,
+      grade_type: 'contractor',
+    }).select('order_id').lean();
+    const gradedOrderIds = new Set(submitted.map(g => String(g.order_id)));
+
+    const gradable = orders
+      .filter(o => !gradedOrderIds.has(String(o._id)))
+      .map(o => ({
+        order_id:        String(o._id),
+        contractor_id:   String(o.contractor_id?._id ?? o.contractor_id),
+        contractor_name: o.contractor_id?.companyName ?? 'Unknown',
+        contractor_email:o.contractor_id?.email ?? '',
+        site_id:         o.site_id ? String(o.site_id._id ?? o.site_id) : null,
+        site_name:       o.site_id?.name ?? null,
+        date:            o.date,
+        order_sum:       o.order_sum,
+      }));
+
+    res.json({ contractors: gradable });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── GET /trade/contractor-grades/:contractorId/reviews ────────────────────────
+// Returns contractor profile + all 'contractor'-type grades submitted by trade pros.
+export async function getContractorReviews(req, res, next) {
+  try {
+    const { contractorId } = req.params;
+
+    const contractor = await Contractor.findById(contractorId)
+      .select('companyName address avgGrade gradeCount')
+      .lean();
+    if (!contractor) return res.status(404).json({ message: 'Contractor not found.' });
+
+    const reviews = await TradeGrade.find({ contractor_id: contractorId, grade_type: 'contractor' })
+      .populate('trade_id', 'fullName professionality photo')
+      .populate('site_id',  'name')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    res.json({
+      contractor: {
+        companyName: contractor.companyName,
+        address:     contractor.address,
+        avgGrade:    contractor.avgGrade,
+        gradeCount:  contractor.gradeCount,
+      },
+      reviews: reviews.map(r => ({
+        _id:         r._id,
+        trade_grade: r.trade_grade,
+        grade_name:  r.grade_name,
+        review_text: r.review_text,
+        photos:      r.photos ?? [],
+        createdAt:   r.createdAt,
+        date:        r.date,
+        tradeName:   r.trade_id?.fullName ?? 'Unknown',
+        tradeProfessionality: r.trade_id?.professionality ?? null,
+        siteName:    r.site_id?.name ?? null,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /trade/contractor-grades/photo ───────────────────────────────────────
+// Upload a single contractor-grade review photo to Cloudinary.
+export async function uploadContractorGradePhoto(req, res, next) {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
+    const result = await uploadPhoto(req.file.buffer, 'tradelink/grade-photos');
+    res.json({ url: result.secure_url });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /trade/contractor-grades ─────────────────────────────────────────────
+// Trade pro submits a grade (1–5) for a contractor.
+export async function submitContractorGrade(req, res, next) {
+  try {
+    const { contractor_id, site_id, order_id, trade_grade, review_text, photos } = req.body;
+    const grade = parseInt(trade_grade, 10);
+    if (!contractor_id || !order_id || isNaN(grade) || grade < 1 || grade > 5) {
+      return res.status(400).json({ message: 'contractor_id, order_id and trade_grade (1–5) are required.' });
+    }
+
+    const photoUrls = Array.isArray(photos)
+      ? photos.filter(u => typeof u === 'string' && u.startsWith('http'))
+      : [];
+
+    const doc = await TradeGrade.findOneAndUpdate(
+      { trade_id: req.userId, order_id },
+      {
+        trade_id:     req.userId,
+        contractor_id,
+        site_id:      site_id || null,
+        order_id,
+        grade_type:   'contractor',
+        trade_grade:  grade,
+        grade_name:   GRADE_NAMES_MAP[grade],
+        review_text:  (review_text ?? '').trim(),
+        photos:       photoUrls,
+        date:         new Date(),
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true }
+    );
+
+    // Recalculate contractor's average grade
+    const [agg] = await TradeGrade.aggregate([
+      { $match: { contractor_id: doc.contractor_id, grade_type: 'contractor' } },
+      { $group: { _id: '$contractor_id', avg: { $avg: '$trade_grade' }, count: { $sum: 1 } } },
+    ]);
+
+    if (agg) {
+      await Contractor.findByIdAndUpdate(contractor_id, {
+        avgGrade:   Math.round(agg.avg * 10) / 10,
+        gradeCount: agg.count,
+      });
+    }
+
+    res.status(201).json({ grade: doc, avgGrade: agg?.avg ?? grade, gradeCount: agg?.count ?? 1 });
+  } catch (err) {
+    if (err.code === 11000) return res.status(409).json({ message: 'Already graded.' });
     next(err);
   }
 }
