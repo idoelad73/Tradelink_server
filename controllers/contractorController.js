@@ -1835,19 +1835,39 @@ export async function getGradableTrades(req, res, next) {
   }
 }
 
+// ── POST /contractor/trade-grades/photo ──────────────────────────────────────
+// Upload a single grade review photo to Cloudinary. Returns { url }.
+export async function uploadGradePhoto(req, res, next) {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
+    const result = await uploadPhoto(req.file.buffer, 'tradelink/grade-photos');
+    res.json({ url: result.secure_url });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // ── POST /contractor/trade-grades ────────────────────────────────────────────
-// Submit a grade (1–5) for a specific trade + site.
+// Submit a grade (1–5) with optional review text and photo URLs.
 export async function submitTradeGrade(req, res, next) {
   try {
-    const { trade_id, site_id, order_id, trade_grade } = req.body;
+    const { trade_id, site_id, order_id, trade_grade, review_text, photos } = req.body;
     const grade = parseInt(trade_grade, 10);
     if (!trade_id || !order_id || isNaN(grade) || grade < 1 || grade > 5) {
       return res.status(400).json({ message: 'trade_id, order_id and trade_grade (1–5) are required.' });
     }
 
+    const photoUrls = Array.isArray(photos) ? photos.filter(u => typeof u === 'string' && u.startsWith('http')) : [];
+
     const doc = await TradeGrade.findOneAndUpdate(
       { contractor_id: req.userId, order_id },
-      { trade_id, site_id: site_id || null, order_id, trade_grade: grade, grade_name: GRADE_NAMES_MAP[grade], date: new Date() },
+      {
+        trade_id, site_id: site_id || null, order_id,
+        trade_grade: grade, grade_name: GRADE_NAMES_MAP[grade],
+        review_text: (review_text ?? '').trim(),
+        photos: photoUrls,
+        date: new Date(),
+      },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 

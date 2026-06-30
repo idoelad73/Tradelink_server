@@ -10,6 +10,8 @@ const tradeGradeSchema = new mongoose.Schema(
     order_id:      { type: mongoose.Schema.Types.ObjectId, ref: 'WorkHoursOrder',default: null  },
     trade_grade:   { type: Number, min: 1, max: 5, required: true },
     grade_name:    { type: String, required: true },   // 'Poor' … 'Excellent'
+    review_text:   { type: String, default: '' },
+    photos:        [{ type: String }],                 // Cloudinary URLs
     date:          { type: Date,   default: Date.now },
   },
   { timestamps: true, collection: 'trade_grades' }

@@ -10,7 +10,7 @@ import {
   getWorkPlan, updateWorkPlanDate, deleteWorkPlanTrade, requestWorkPlanDate,
   approveReschedule, declineReschedule,
   getPaymentApprovalsCount, getPaymentApprovals, updatePaymentApproval,
-  getGradableTrades, submitTradeGrade,
+  getGradableTrades, submitTradeGrade, uploadGradePhoto,
   getSiteDepositSummary, confirmDeposit,
 } from '../controllers/contractorController.js';
 
@@ -49,8 +49,9 @@ router.get('/payment-approvals',             getPaymentApprovals);
 router.patch('/payment-approvals/:orderId',  updatePaymentApproval);
 
 // Trade grading
-router.get('/trade-grades/eligible', getGradableTrades);
-router.post('/trade-grades',         submitTradeGrade);
+router.get('/trade-grades/eligible',  getGradableTrades);
+router.post('/trade-grades/photo',    upload.single('photo'), uploadGradePhoto);
+router.post('/trade-grades',          submitTradeGrade);
 
 // Sites — full CRUD
 router.post('/sites',       upload.single('photo'), createSite);
