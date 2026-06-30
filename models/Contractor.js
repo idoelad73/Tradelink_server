@@ -21,7 +21,8 @@ const contractorSchema = new Schema(
     loginCount:  { type: Number,  default: 0     },
 
     // ── Stripe — store only Stripe IDs, never raw card data ──
-    stripeCustomerId: { type: String, default: null },
+    stripeCustomerId:            { type: String, default: null },
+    stripeDefaultPaymentMethod:  { type: String, default: null }, // saved from last deposit for off-session overage charges
   },
   { timestamps: true }
 );

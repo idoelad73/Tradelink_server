@@ -112,10 +112,11 @@ export async function getMe(req, res, next) {
 
         tradeObj.bookings = tradeObj.bookings.map(b => {
           const siteInfo = siteMap[String(b.siteId)];
-          const workers  = workersBySite[String(b.siteId)] ?? 1;
+          // Booking document stores workers_no directly; fall back to accepted application message
+          const workers  = b.workers_no || workersBySite[String(b.siteId)] || 1;
           return siteInfo
             ? { ...b, totalHours: siteInfo.totalHours, budgetType: siteInfo.budgetType, workers_no: workers }
-            : b;
+            : { ...b, workers_no: workers };
         });
       }
     }

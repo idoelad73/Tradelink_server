@@ -177,12 +177,14 @@ export async function createDepositIntent(req, res, next) {
     }
 
     // Create fresh PI — use card only (compatible with capture_method: 'manual')
+    // setup_future_usage: 'off_session' saves the card so overage charges need no modal.
     const paymentIntent = await stripe.paymentIntents.create({
       amount:               amountCents,
       currency:             'usd',
       customer:             customerId,
       capture_method:       'manual',
       payment_method_types: ['card'],
+      setup_future_usage:   'off_session',
       metadata: {
         siteId:       String(siteId),
         contractorId: String(req.userId),

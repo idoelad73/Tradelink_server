@@ -406,36 +406,50 @@ export async function markNotificationsRead(req, res, next) {
 }
 
 // GET /api/contractor/sites/:id/work-plan
-// Returns all assigned trades for a site with trade pro details
+// Returns all trade pros booked to this site (primary: tradepros.bookings.siteId query;
+// augmented with slot details from site.tradesNeeded for date/budget).
 export async function getWorkPlan(req, res, next) {
   try {
-    const site = await Site.findOne({ _id: req.params.id, contractor: req.userId })
-      .select('name tradesNeeded')
-      .lean();
+    const siteId = req.params.id;
+
+    const [site, bookedPros] = await Promise.all([
+      Site.findOne({ _id: siteId, contractor: req.userId })
+        .select('name tradesNeeded')
+        .lean(),
+      TradePro.find({ 'bookings.siteId': siteId })
+        .select('fullName professionality hourlyRate bookings')
+        .lean(),
+    ]);
+
     if (!site) return res.status(404).json({ message: 'Site not found' });
 
-    // Only include assigned trades
-    const assigned = site.tradesNeeded.filter(t => t.assigned && t.tradeProId);
+    // Map tradeProId → assigned slot for date + budget lookup
+    const slotByProId = {};
+    for (const slot of site.tradesNeeded ?? []) {
+      if (slot.tradeProId) slotByProId[String(slot.tradeProId)] = slot;
+    }
 
-    // Fetch trade pro names in one query
-    const tradeProIds = assigned.map(t => t.tradeProId);
-    const pros = await (await import('../models/TradePro.js'))
-      .default.find({ _id: { $in: tradeProIds } })
-      .select('fullName professionality')
-      .lean();
-    const proMap = Object.fromEntries(pros.map(p => [String(p._id), p]));
+    const rows = bookedPros.map(pro => {
+      const slot       = slotByProId[String(pro._id)];
+      const booking    = pro.bookings.find(b => String(b.siteId) === String(siteId));
+      // Use booking values first — they are snapshotted at approval time and are authoritative.
+      // slot.workers_no can be 0 (decremented as workers are assigned) so must not be used as primary.
+      const totalHours = booking?.totalHours ?? slot?.totalHours ?? null;
+      const workersNo  = booking?.workers_no || slot?.workers_no || 1;
+      const rate       = pro.hourlyRate ?? null;
+      const total      = (totalHours && rate) ? parseFloat((workersNo * totalHours * rate).toFixed(2)) : null;
 
-    const rows = assigned.map(t => ({
-      professionality: t.name,
-      tradeName:       proMap[String(t.tradeProId)]?.fullName ?? '—',
-      tradeProId:      String(t.tradeProId),
-      date:            t.requiredDate ?? '—',
-      budget:          t.budgetType === 'amount' && t.maxAmount
-                         ? `$${t.maxAmount}`
-                         : t.budgetType === 'hours' && t.totalHours
-                           ? `${t.totalHours}h`
-                           : '—',
-    }));
+      return {
+        professionality: pro.professionality,
+        tradeName:       pro.fullName,
+        tradeProId:      String(pro._id),
+        date:            slot?.requiredDate ?? booking?.dates?.[0] ?? '—',
+        workers_no:      workersNo,
+        totalHours,
+        hourlyRate:      rate,
+        budgetTotal:     total,   // workers_no × totalHours × hourlyRate
+      };
+    });
 
     res.json({ siteName: site.name, rows });
   } catch (err) {
@@ -1188,6 +1202,12 @@ export async function confirmDeposit(req, res, next) {
     // Mark the worker_offer as held
     await Message.findByIdAndUpdate(source._id, { depositStatus: 'held' });
 
+    // Save payment method for future off-session overage charges (no card modal needed)
+    if (pi.payment_method) {
+      await Contractor.findByIdAndUpdate(req.userId, { stripeDefaultPaymentMethod: pi.payment_method });
+      console.log(`[confirmDeposit] saved PM ${pi.payment_method} on contractor for future off-session charges`);
+    }
+
     // Use Stripe's amount as the authoritative deposit sum (pi.amount is in cents)
     const stripeAmount = pi.amount / 100;
 
@@ -1533,33 +1553,73 @@ export async function updatePaymentApproval(req, res, next) {
     const siteId  = pendingMsg.site?._id    ?? pendingMsg.site ?? null;
 
     // ── OVERAGE CHECK (before order creation) ────────────────────────────────
-    // If lockedSum > depositHeld, the contractor must pay the difference now.
-    const overagePiId = req.body.overagePiId ?? null;
+    // Compare lockedSum against what REMAINS in the deposit after prior approvals.
+    let overagePiId = req.body.overagePiId ?? null;
+    let _depositMsgForCheck = null; // reused below in transfer section
     if (status === 'approved' && lockedSum > 0) {
-      const depositMsgForCheck = await Message.findOne({
+      _depositMsgForCheck = await Message.findOne({
         site:       siteId,
         contractor: req.userId,
         type:       'payment',
         status:     'deposited',
       }).lean();
-      const depositHeld = depositMsgForCheck?.min_deposit ?? 0;
-      const overageAmt  = parseFloat((lockedSum - depositHeld).toFixed(2));
+
+      const depositHeld = _depositMsgForCheck?.min_deposit ?? 0;
+
+      // Sum all prior approved orders that drew from this deposit PI
+      const priorOrders = await WorkHoursOrder.find({
+        site_id:               siteId,
+        contractor_id:         req.userId,
+        stripePaymentIntentId: _depositMsgForCheck?.stripeDepositIntentId ?? '__none__',
+        status:                'approved',
+      }).lean();
+      const transferredSoFar = priorOrders.reduce((s, o) => s + (o.order_sum || 0), 0);
+      const remainingDeposit = Math.max(0, parseFloat((depositHeld - transferredSoFar).toFixed(2)));
+      const overageAmt       = parseFloat((Math.max(0, lockedSum - remainingDeposit)).toFixed(2));
+
+      console.log(`[updatePaymentApproval] deposit=$${depositHeld} transferredSoFar=$${transferredSoFar} remaining=$${remainingDeposit} lockedSum=$${lockedSum} overage=$${overageAmt}`);
 
       if (overageAmt > 0 && !overagePiId) {
-        const pi = await stripe.paymentIntents.create({
-          amount:                    Math.round(overageAmt * 100),
-          currency:                  'usd',
-          automatic_payment_methods: { enabled: true },
-          description:               `TradeLink — Work overage for ${pendingMsg.tradePro.professionality}`,
-          metadata:                  { siteId: String(siteId), contractorId: String(req.userId) },
-        });
-        console.log(`[updatePaymentApproval] ⚠️ overage detected: lockedSum=$${lockedSum} depositHeld=$${depositHeld} overage=$${overageAmt} — created PI ${pi.id}`);
-        return res.status(402).json({
-          needsOverage:  true,
-          overageAmount: overageAmt,
-          clientSecret:  pi.client_secret,
-          piId:          pi.id,
-        });
+        // Try to charge off-session using the contractor's saved payment method (no modal)
+        const contractor = await Contractor.findById(req.userId).select('stripeCustomerId stripeDefaultPaymentMethod').lean();
+        if (contractor?.stripeDefaultPaymentMethod && contractor?.stripeCustomerId) {
+          try {
+            const offSessionPi = await stripe.paymentIntents.create({
+              amount:           Math.round(overageAmt * 100),
+              currency:         'usd',
+              customer:         contractor.stripeCustomerId,
+              payment_method:   contractor.stripeDefaultPaymentMethod,
+              confirm:          true,
+              off_session:      true,
+              description:      `TradeLink — Work overage for ${pendingMsg.tradePro.professionality}`,
+              metadata:         { siteId: String(siteId), contractorId: String(req.userId) },
+            });
+            overagePiId = offSessionPi.id;
+            console.log(`[updatePaymentApproval] ✅ off-session overage charge $${overageAmt} — PI ${overagePiId} status=${offSessionPi.status}`);
+          } catch (offErr) {
+            // Off-session failed (3DS required, expired card, etc.) — fall back to modal
+            console.warn(`[updatePaymentApproval] off-session overage failed: ${offErr.message} — returning 402 for modal`);
+            const pi = await stripe.paymentIntents.create({
+              amount:                    Math.round(overageAmt * 100),
+              currency:                  'usd',
+              customer:                  contractor.stripeCustomerId,
+              automatic_payment_methods: { enabled: true },
+              description:               `TradeLink — Work overage for ${pendingMsg.tradePro.professionality}`,
+              metadata:                  { siteId: String(siteId), contractorId: String(req.userId) },
+            });
+            return res.status(402).json({ needsOverage: true, overageAmount: overageAmt, clientSecret: pi.client_secret, piId: pi.id });
+          }
+        } else {
+          // No saved PM — show modal
+          const pi = await stripe.paymentIntents.create({
+            amount:                    Math.round(overageAmt * 100),
+            currency:                  'usd',
+            automatic_payment_methods: { enabled: true },
+            description:               `TradeLink — Work overage for ${pendingMsg.tradePro.professionality}`,
+            metadata:                  { siteId: String(siteId), contractorId: String(req.userId) },
+          });
+          return res.status(402).json({ needsOverage: true, overageAmount: overageAmt, clientSecret: pi.client_secret, piId: pi.id });
+        }
       }
     }
 
@@ -1616,8 +1676,8 @@ export async function updatePaymentApproval(req, res, next) {
     if (lockedSum > 0) {
       const amountCents = Math.round(lockedSum * 100);
 
-      // Find the held deposit PI for this site
-      const depositMsg = await Message.findOne({
+      // Reuse the deposit message already fetched in the overage check (avoid double query)
+      const depositMsg = _depositMsgForCheck ?? await Message.findOne({
         site:       siteId,
         contractor: req.userId,
         type:       'payment',
@@ -1655,9 +1715,19 @@ export async function updatePaymentApproval(req, res, next) {
       }
 
       // ── Split transfer: deposit portion + overage portion ────────────────────
+      // depositTransfer = what we can draw from the deposit charge (remaining, not full deposit)
       const depositHeldAmt   = depositMsg?.min_deposit ?? 0;
-      const depositTransfer  = Math.min(lockedSum, depositHeldAmt);          // from deposit charge
-      const overageTransfer  = parseFloat((lockedSum - depositTransfer).toFixed(2)); // from overage PI
+      const priorApproved    = await WorkHoursOrder.find({
+        site_id:               siteId,
+        contractor_id:         req.userId,
+        stripePaymentIntentId: depositMsg?.stripeDepositIntentId ?? '__none__',
+        status:                'approved',
+        _id:                   { $ne: newOrder._id }, // exclude the just-created order
+      }).lean();
+      const alreadyTransferred = priorApproved.reduce((s, o) => s + (o.order_sum || 0), 0);
+      const remaining          = Math.max(0, depositHeldAmt - alreadyTransferred);
+      const depositTransfer    = Math.min(lockedSum, remaining);
+      const overageTransfer    = parseFloat((lockedSum - depositTransfer).toFixed(2));
 
       if (stripeAccountId && depositTransfer > 0 && sourceChargeId) {
         try {
