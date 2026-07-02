@@ -9,6 +9,7 @@ import {
   getNotifications, markNotificationsRead,
   getWorkPlan, updateWorkPlanDate, deleteWorkPlanTrade, requestWorkPlanDate,
   approveReschedule, declineReschedule,
+  getMyOrders, getMyReceipts,
   getPaymentApprovalsCount, getPaymentApprovals, updatePaymentApproval,
   getGradableTrades, submitTradeGrade, uploadGradePhoto, getTradeReviews,
   getSiteDepositSummary, confirmDeposit,
@@ -42,6 +43,10 @@ router.patch('/messages/:id/approve-worker-offer', approveWorkerOffer);
 // Availability-approved notifications
 router.get('/notifications',       getNotifications);
 router.patch('/notifications/read', markNotificationsRead);
+
+// Orders / receipts
+router.get('/receipts', getMyReceipts);
+router.get('/orders',   getMyOrders);
 
 // Payment approvals (tradehours_orders)
 router.get('/payment-approvals/count',       getPaymentApprovalsCount);

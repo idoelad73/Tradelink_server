@@ -28,6 +28,8 @@ function normalizeTrades(raw) {
 import TradePro from '../models/TradePro.js';
 import Message from '../models/Message.js';
 import WorkHoursOrder from '../models/WorkHoursOrder.js';
+import Counter from '../models/Counter.js';
+import Receipt from '../models/Receipt.js';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
 import jwt from 'jsonwebtoken';
@@ -35,6 +37,17 @@ import stripe from '../utils/stripe.js';
 import { sendMail } from '../utils/mailer.js';
 
 const PLATFORM_FEE_PERCENT = parseFloat(process.env.STRIPE_PLATFORM_FEE_PERCENT ?? '0');
+
+async function nextReceiptNumber(type) {
+  const prefix    = type === 'contractor' ? 'C' : 'T';
+  const counterId = `${type}_receipt`;
+  const counter   = await Counter.findOneAndUpdate(
+    { _id: counterId },
+    { $inc: { seq: 1 } },
+    { new: true, upsert: true }
+  );
+  return prefix + String(counter.seq).padStart(6, '0');
+}
 
 // GET /api/contractor/me
 // Returns contractor profile + count of sites
@@ -1223,6 +1236,42 @@ export async function findTrades(req, res, next) {
 }
 
 // ── Payment Approvals ────────────────────────────────────────────────────────
+// GET /api/contractor/receipts
+export async function getMyReceipts(req, res, next) {
+  try {
+    const { tradeName, siteName, dateFrom, dateTo } = req.query;
+
+    const filter = { contractor_id: req.userId, receipt_type: 'contractor' };
+
+    if (tradeName) filter.trade_name = { $regex: tradeName.trim(), $options: 'i' };
+    if (siteName)  filter.site_name  = { $regex: siteName.trim(),  $options: 'i' };
+    if (dateFrom || dateTo) {
+      filter.date = {};
+      if (dateFrom) filter.date.$gte = dateFrom;
+      if (dateTo)   filter.date.$lte = dateTo;
+    }
+
+    const receipts = await Receipt.find(filter).sort({ createdAt: -1 }).lean();
+    res.json({ receipts });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/contractor/orders — all paid WorkHoursOrders for the logged-in contractor
+export async function getMyOrders(req, res, next) {
+  try {
+    const orders = await WorkHoursOrder.find({ contractor_id: req.userId })
+      .populate('trade_id', 'fullName professionality photo')
+      .populate('site_id',  'name address')
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ orders });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // tradehours_orders is APPROVED-ONLY. Pending requests arrive as payment_pending
 // Messages. On approve: create WorkHoursOrder (approved) + payment_approved msg
 // + delete the pending msg. On reject: create payment_rejected msg + delete pending.
@@ -1567,15 +1616,66 @@ export async function updatePaymentApproval(req, res, next) {
           receiptSent:           false,
         });
 
-        // Send receipt email to contractor when payment is confirmed
+        // Create receipt documents + send receipt email when transfer is confirmed
         if (transferId) {
           try {
             const contractor = await Contractor.findById(req.userId).select('companyName email').lean();
             const contractorEmail = contractor?.email;
+            const tradeName        = pendingMsg.tradePro?.fullName        ?? 'Trade Pro';
+            const tradeProfession  = pendingMsg.tradePro?.professionality ?? '—';
+            const siteDoc          = await Site.findById(siteId).select('name address').lean();
+            const siteName         = siteDoc?.name    ?? '—';
+            const siteAddress      = siteDoc?.address ?? '—';
+
+            // ── Create contractor receipt ──────────────────────────────────
+            const contractorReceiptNo = await nextReceiptNumber('contractor');
+            await Receipt.create({
+              receipt_number:        contractorReceiptNo,
+              receipt_type:          'contractor',
+              order_id:              newOrder._id,
+              contractor_id:         req.userId,
+              trade_id:              pendingMsg.tradePro?._id,
+              site_id:               siteId,
+              contractor_name:       contractor?.companyName ?? '—',
+              trade_name:            tradeName,
+              trade_professionality: tradeProfession,
+              site_name:             siteName,
+              site_address:          siteAddress,
+              date:                  newOrder.date,
+              actual_hours:          newOrder.actual_hours,
+              workers_no:            newOrder.workers_no,
+              hourly_rate:           newOrder.hourly_rate,
+              order_sum:             lockedSum,
+              fee_sum:               feeDollars,
+              payment_sum:           payoutAmount,
+              paymentStatus:         'paid',
+            });
+
+            // ── Create trade receipt ───────────────────────────────────────
+            const tradeReceiptNo = await nextReceiptNumber('trade');
+            await Receipt.create({
+              receipt_number:        tradeReceiptNo,
+              receipt_type:          'trade',
+              order_id:              newOrder._id,
+              contractor_id:         req.userId,
+              trade_id:              pendingMsg.tradePro?._id,
+              site_id:               siteId,
+              contractor_name:       contractor?.companyName ?? '—',
+              trade_name:            tradeName,
+              trade_professionality: tradeProfession,
+              site_name:             siteName,
+              site_address:          siteAddress,
+              date:                  newOrder.date,
+              actual_hours:          newOrder.actual_hours,
+              workers_no:            newOrder.workers_no,
+              hourly_rate:           newOrder.hourly_rate,
+              order_sum:             lockedSum,
+              fee_sum:               feeDollars,
+              payment_sum:           payoutAmount,
+              paymentStatus:         'paid',
+            });
+
             if (contractorEmail) {
-              const tradeName   = pendingMsg.tradePro?.fullName ?? 'Trade Pro';
-              const siteDoc     = await Site.findById(siteId).select('name').lean();
-              const siteName    = siteDoc?.name ?? '—';
               const displayDate = newOrder.date
                 ? new Date(newOrder.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
                 : '—';

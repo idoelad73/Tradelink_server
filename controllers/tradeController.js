@@ -4,6 +4,7 @@ import Contractor from '../models/Contractor.js';
 import Message from '../models/Message.js';
 import Site from '../models/Site.js';
 import WorkHoursOrder from '../models/WorkHoursOrder.js';
+import Receipt from '../models/Receipt.js';
 import TradeGrade, { GRADE_NAMES_MAP } from '../models/TradeGrade.js';
 import jwt from 'jsonwebtoken';
 import { uploadPhoto } from '../utils/cloudinary.js';
@@ -730,6 +731,42 @@ export async function applyToJob(req, res, next) {
 // Called on TradeDashboard mount. Returns minimal approved records so the client can:
 //   1. Colour those calendar days light-blue
 //   2. Disable the clock icon (can't log hours twice for an approved date)
+// GET /api/trade/receipts
+export async function getMyReceipts(req, res, next) {
+  try {
+    const { contractorName, siteName, dateFrom, dateTo } = req.query;
+
+    const filter = { trade_id: req.userId, receipt_type: 'trade' };
+
+    if (contractorName) filter.contractor_name = { $regex: contractorName.trim(), $options: 'i' };
+    if (siteName)       filter.site_name       = { $regex: siteName.trim(),       $options: 'i' };
+    if (dateFrom || dateTo) {
+      filter.date = {};
+      if (dateFrom) filter.date.$gte = dateFrom;
+      if (dateTo)   filter.date.$lte = dateTo;
+    }
+
+    const receipts = await Receipt.find(filter).sort({ createdAt: -1 }).lean();
+    res.json({ receipts });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/trade/orders — all WorkHoursOrders for this trade pro (receipts)
+export async function getMyOrders(req, res, next) {
+  try {
+    const orders = await WorkHoursOrder.find({ trade_id: req.userId })
+      .populate('contractor_id', 'companyName')
+      .populate('site_id',       'name address')
+      .sort({ createdAt: -1 })
+      .lean();
+    res.json({ orders });
+  } catch (err) {
+    next(err);
+  }
+}
+
 export async function getApprovedOrderDates(req, res, next) {
   try {
     const orders = await WorkHoursOrder.find({ trade_id: req.userId, status: 'approved' })

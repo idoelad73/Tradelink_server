@@ -1,22 +1,11 @@
-import nodemailer from 'nodemailer';
+import { Resend } from 'resend';
 
-function createTransporter() {
-  return nodemailer.createTransport({
-    service: 'gmail',
-    auth: {
-      user: process.env.GMAIL_USER,
-      pass: process.env.GMAIL_APP_PASSWORD,
-    },
-  });
-}
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+const FROM = process.env.RESEND_FROM_EMAIL ?? 'TradeLink <noreply@tradelink.com>';
 
 // @param {{ to, subject, html }} options
 export async function sendMail({ to, subject, html }) {
-  const transporter = createTransporter();
-  await transporter.sendMail({
-    from: `"TradeLink" <${process.env.GMAIL_USER}>`,
-    to,
-    subject,
-    html,
-  });
+  const { error } = await resend.emails.send({ from: FROM, to, subject, html });
+  if (error) throw new Error(`Resend error: ${error.message}`);
 }

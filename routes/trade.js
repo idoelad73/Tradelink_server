@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { protect, restrictTo } from '../middleware/auth.js';
 import { photoUpload, handleUploadError } from '../middleware/upload.js';
-import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking, getApprovedOrderDates, checkWorkLog, submitWorkLog, getPaymentApprovedCount, getPaymentApproved, getGradableContractors, uploadContractorGradePhoto, submitContractorGrade, getContractorReviews } from '../controllers/tradeController.js';
+import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking, getMyOrders, getMyReceipts, getApprovedOrderDates, checkWorkLog, submitWorkLog, getPaymentApprovedCount, getPaymentApproved, getGradableContractors, uploadContractorGradePhoto, submitContractorGrade, getContractorReviews } from '../controllers/tradeController.js';
 import { createOnboardingLink, completeOnboarding, getStripeStatus } from '../controllers/tradeStripeController.js';
 
 const router = Router();
@@ -22,6 +22,8 @@ router.patch('/schedule',   updateSchedule);
 router.patch('/location',   updateLocation);
 router.post('/reschedule',  requestReschedule);
 router.delete('/bookings',  removeBooking);
+router.get('/receipts',         getMyReceipts);
+router.get('/orders',           getMyOrders);
 router.get('/approved-orders',  getApprovedOrderDates);
 router.get('/work-log/check',   checkWorkLog);
 router.post('/work-log',      submitWorkLog);
