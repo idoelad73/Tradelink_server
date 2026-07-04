@@ -33,6 +33,16 @@ router.get('/address/autocomplete', async (req, res) => {
   }
 });
 
+// Public — returns all distinct trade types (professionality values) from trade_pros
+router.get('/trade-types', async (_req, res, next) => {
+  try {
+    const types = await TradePro.distinct('professionality');
+    res.json({ types: types.filter(Boolean).sort() });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // Public — returns all trade professionals for the contractor showcase
 router.get('/tradepros', async (_req, res, next) => {
   try {
