@@ -244,8 +244,12 @@ export async function getWorkersLeft(req, res, next) {
 export async function askAvailability(req, res, next) {
   try {
     const { date, siteName, siteAddress = '', lang = 'en', siteId,
-            tradeName = '' } = req.body;
-    const workersOffered = 1; // contractor never sets workers — trade pro determines this
+            tradeName = '', workersOffered: rawWorkers, totalHours: rawHours } = req.body;
+    // For direct search (no site) the contractor specifies workers+hours upfront;
+    // for site-based requests the trade pro determines workers via the site slot.
+    const workersOffered = siteId ? 1 : Math.max(1, parseInt(rawWorkers) || 1);
+    const totalHours     = (!siteId && rawHours) ? parseFloat(rawHours) : null;
+    console.log(`[askAvailability] date=${date} siteId=${siteId||'(direct)'} workersOffered=${workersOffered} totalHours=${totalHours}`);
     if (!date) return res.status(400).json({ message: 'date is required' });
 
     // ── Check worker slots before doing anything else ─────────────────────
@@ -281,20 +285,19 @@ export async function askAvailability(req, res, next) {
       }
     }
 
-    // Create message record + increment counter
-    if (siteId) {
-      await Message.create({
-        tradePro:       req.params.tradeId,
-        site:           siteId,
-        contractor:     req.userId,
-        requestedDate:  date,
-        tradeName,
-        workersOffered: 1,
-        status:         'pending',
-        type:           'availability',
-        senderType:     'contractor',
-      });
-    }
+    // Create message record + increment counter (site is optional for direct searches)
+    await Message.create({
+      tradePro:       req.params.tradeId,
+      site:           siteId || null,
+      contractor:     req.userId,
+      requestedDate:  date,
+      tradeName,
+      workersOffered,
+      totalHours,
+      status:         'pending',
+      type:           'availability',
+      senderType:     'contractor',
+    });
     await TradePro.findByIdAndUpdate(req.params.tradeId, {
       $inc: { availabilityMessages: 1 },
     });
@@ -560,7 +563,7 @@ export async function approveWorkerOffer(req, res, next) {
     const workersOffered     = msg.workersOffered ?? 1;
     const currentWorkers     = tradeSlot?.workers_no ?? 0;
     const newWorkersCount    = Math.max(0, currentWorkers - workersOffered);
-    const totalHours         = tradeSlot?.totalHours ?? null;
+    const totalHours         = tradeSlot?.totalHours ?? msg.totalHours ?? null;
     const hourlyRate         = msg.tradePro?.hourlyRate ?? null;
     const newTotalWorkingHrs = (tradeSlot?.budgetType === 'hours' && totalHours)
       ? totalHours * newWorkersCount : null;
@@ -605,7 +608,7 @@ export async function approveWorkerOffer(req, res, next) {
       console.log(`[approveWorkerOffer] Site.updateOne matched=${updateResult.matchedCount} modified=${updateResult.modifiedCount}`);
     }
 
-    res.json({ ok: true, slotsRemaining: newWorkersCount, siteId: String(msg.site._id) });
+    res.json({ ok: true, slotsRemaining: newWorkersCount, siteId: msg.site ? String(msg.site._id) : null, minDeposit, messageId: String(msg._id) });
   } catch (err) {
     next(err);
   }
@@ -646,11 +649,12 @@ export async function approveReschedule(req, res, next) {
       await TradePro.updateOne(
         { _id: msg.tradePro._id },
         { $push: { bookings: {
-          siteId:      oldBooking.siteId,
-          siteName:    oldBooking.siteName,
-          siteAddress: oldBooking.siteAddress,
-          dates:       [newDate],
-          status:      'booked',
+          siteId:       oldBooking.siteId,
+          siteName:     oldBooking.siteName,
+          siteAddress:  oldBooking.siteAddress,
+          booking_date: newDate,
+          dates:        [newDate],
+          status:       'booked',
         }}}
       );
     }
@@ -854,13 +858,14 @@ export async function approveAvailabilityRequest(req, res, next) {
       await TradePro.updateOne(
         { _id: msg.tradePro._id },
         { $push: { bookings: {
-          siteId:      msg.site._id,
-          siteName:    msg.site.name,
-          siteAddress: msg.site.address,
-          dates:       [finalDate],
-          status:      'booked',
-          totalHours:  tradeSlot?.totalHours   ?? null,
-          workers_no:  workersOffered,                    // workers THIS trade pro brings
+          siteId:       msg.site._id,
+          siteName:     msg.site.name,
+          siteAddress:  msg.site.address,
+          booking_date: finalDate,
+          dates:        [finalDate],
+          status:       'booked',
+          totalHours:   tradeSlot?.totalHours ?? null,
+          workers_no:   workersOffered,
         }}}
       );
     }
@@ -966,11 +971,12 @@ export async function getSiteDepositSummary(req, res, next) {
 // and creates a new type:'payment' status:'deposited' message to record the deposit event.
 export async function confirmDeposit(req, res, next) {
   try {
-    const { siteId, paymentIntentId } = req.body;
-    console.log(`\n[confirmDeposit] siteId=${siteId} piId=${paymentIntentId} contractorId=${req.userId}`);
+    const { siteId, messageId, paymentIntentId } = req.body;
+    const isDirect = !!messageId && !siteId;
+    console.log(`\n[confirmDeposit] siteId=${siteId||'(none)'} messageId=${messageId||'(none)'} piId=${paymentIntentId} contractorId=${req.userId}`);
 
-    if (!siteId || !paymentIntentId) {
-      return res.status(400).json({ message: 'siteId and paymentIntentId are required' });
+    if ((!siteId && !messageId) || !paymentIntentId) {
+      return res.status(400).json({ message: 'siteId or messageId, and paymentIntentId are required' });
     }
 
     // Verify with Stripe that the hold is in place
@@ -982,7 +988,7 @@ export async function confirmDeposit(req, res, next) {
 
     // Find the stamped source message — could be worker_offer OR approval type
     const source = await Message.findOne({
-      site:       siteId,
+      ...(isDirect ? { _id: messageId } : { site: siteId }),
       contractor: req.userId,
       stripeDepositIntentId: paymentIntentId,
       type:       { $in: ['worker_offer', 'approval'] },
@@ -1035,6 +1041,20 @@ export async function confirmDeposit(req, res, next) {
 export async function getTradeBusyDays(req, res, next) {
   try {
     const pro = await TradePro.findById(req.params.tradeId).select('fullName professionality busyDays bookings photo');
+    if (!pro) return res.status(404).json({ message: 'Trade professional not found' });
+    res.json({ pro });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/contractor/trade-pros/:tradeId/profile
+// Returns full public profile of a trade pro (for the contractor's info modal)
+export async function getTradeProProfile(req, res, next) {
+  try {
+    const pro = await TradePro.findById(req.params.tradeId).select(
+      'fullName professionality photo hourlyRate address phone email licenseDoc insuranceDoc cv avgGrade gradeCount workingHours portfolioPhotos createdAt'
+    );
     if (!pro) return res.status(404).json({ message: 'Trade professional not found' });
     res.json({ pro });
   } catch (err) {
@@ -1160,15 +1180,12 @@ export async function findTrades(req, res, next) {
     }
 
     // ── HARD FILTER: exclude trades already booked on the requiredDate ────────
-    // A trade is "booked" when an approval pushed their date into bookings[].dates.
-    // Also exclude trades who manually marked that day as busy (busyDays).
+    // booking_date is a flat String on each booking subdocument — $nin traversal is reliable.
     if (requiredDate) {
       pipeline.push({
         $match: {
-          // must NOT have requiredDate in any booking's dates array
-          'bookings.dates': { $nin: [requiredDate] },
-          // must NOT have requiredDate in their personal busyDays
-          busyDays: { $nin: [requiredDate] },
+          'bookings.booking_date': { $nin: [requiredDate] },
+          busyDays:                { $nin: [requiredDate] },
         },
       });
     }
@@ -1302,7 +1319,7 @@ export async function getPaymentApprovals(req, res, next) {
       .sort({ createdAt: -1 })
       .lean();
 
-    const orders = msgs.map((m) => {
+    const orders = await Promise.all(msgs.map(async (m) => {
       const snap = (() => { try { return JSON.parse(m.text || '{}'); } catch { return {}; } })();
 
       const liveRate  = m.tradePro?.hourlyRate ?? snap.hourly_rate ?? null;
@@ -1322,6 +1339,15 @@ export async function getPaymentApprovals(req, res, next) {
       const effective        = minHours > 0 ? Math.max(actual, minHours) : actual;
       const orderSum         = liveRate ? parseFloat((effective * liveRate * effectiveWorkers).toFixed(2)) : 0;
 
+      // ── Look up the deposit held for this trade pro (deposited payment message) ──
+      const depositMsg = await Message.findOne({
+        tradePro:   m.tradePro?._id ?? m.tradePro,
+        contractor: req.userId,
+        ...(m.site ? { site: m.site?._id ?? m.site } : { site: null }),
+        type:   'payment',
+        status: 'deposited',
+      }).sort({ createdAt: -1 }).select('min_deposit').lean();
+
       return {
         _id:          m._id,
         trade_id:     m.tradePro,
@@ -1333,10 +1359,11 @@ export async function getPaymentApprovals(req, res, next) {
         hourly_rate:  liveRate,
         workers_no:   effectiveWorkers,  // workers the trade pro submitted in work log
         order_sum:    orderSum,
+        min_deposit:  depositMsg?.min_deposit ?? null,
         status:       'pending',
         createdAt:    m.createdAt,
       };
-    });
+    }));
 
     res.json({ orders });
   } catch (err) {
@@ -1391,6 +1418,7 @@ export async function updatePaymentApproval(req, res, next) {
     let _depositMsgForCheck = null; // reused below in transfer section
     if (status === 'approved' && lockedSum > 0) {
       _depositMsgForCheck = await Message.findOne({
+        tradePro:   tradeId,
         site:       siteId,
         contractor: req.userId,
         type:       'payment',
@@ -1511,6 +1539,7 @@ export async function updatePaymentApproval(req, res, next) {
 
       // Reuse the deposit message already fetched in the overage check (avoid double query)
       const depositMsg = _depositMsgForCheck ?? await Message.findOne({
+        tradePro:   tradeId,
         site:       siteId,
         contractor: req.userId,
         type:       'payment',

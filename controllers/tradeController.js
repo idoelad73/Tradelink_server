@@ -210,13 +210,14 @@ export async function approveBooking(req, res) {
     });
     await TradePro.findByIdAndUpdate(tradeId, {
       $push: { bookings: {
-        siteId:      siteId ?? undefined,
+        siteId:       siteId ?? undefined,
         siteName,
         siteAddress,
-        dates:       [date],
-        status:      'booked',
-        totalHours:  tradeSlot?.totalHours ?? null,
-        workers_no:  workersOffered,
+        booking_date: date,
+        dates:        [date],
+        status:       'booked',
+        totalHours:   tradeSlot?.totalHours ?? null,
+        workers_no:   workersOffered,
       }},
     });
     console.log(`[approveBooking] ✓ booking pushed for "${siteName}" on ${date}`);
@@ -368,7 +369,8 @@ export async function approveMessage(req, res, next) {
     const workersOffered = Math.max(1, parseInt(req.body?.workersOffered) || 1);
 
     const msg = await Message.findOne({ _id: req.params.id, tradePro: req.userId })
-      .populate('site', 'name address tradesNeeded');
+      .populate('site',       'name address tradesNeeded')
+      .populate('contractor', 'companyName');
     if (!msg) return res.status(404).json({ message: 'Message not found' });
     if (msg.status === 'approved') return res.json({ message: 'Already approved' });
 
@@ -387,37 +389,64 @@ export async function approveMessage(req, res, next) {
     msg.workersOffered = workersOffered;
     await msg.save();
 
-    // Push booking onto trade pro (confirmed from their side, pending contractor acknowledgement)
-    await TradePro.findByIdAndUpdate(req.userId, {
-      $pull: { bookings: { siteId: msg.site._id } },
-    });
-    await TradePro.findByIdAndUpdate(req.userId, {
-      $push: { bookings: {
-        siteId:      msg.site._id,
-        siteName:    msg.site.name,
-        siteAddress: msg.site.address,
-        dates:       [msg.requestedDate],
-        status:      'booked',
-        totalHours:  totalHours,
-        workers_no:  workersOffered,
-      }},
-    });
-
-    // Create a worker_offer message for the contractor to approve.
-    // workers_no on the site is only decremented after contractor approves.
-    await Message.create({
-      tradePro:      req.userId,
-      site:          msg.site._id,
-      contractor:    msg.contractor,
-      requestedDate: msg.requestedDate,
-      tradeName:     tradeName,
-      workersOffered,
-      status:        'pending',
-      type:          'worker_offer',
-      senderType:    'trade',
-    });
-
-    console.log(`[approveMessage] worker_offer created — ${pro?.professionality} offering ${workersOffered} workers for "${msg.site?.name}"`);
+    if (msg.site) {
+      // Site-linked flow — push booking and notify contractor
+      await TradePro.findByIdAndUpdate(req.userId, {
+        $pull: { bookings: { siteId: msg.site._id } },
+      });
+      await TradePro.findByIdAndUpdate(req.userId, {
+        $push: { bookings: {
+          siteId:       msg.site._id,
+          siteName:     msg.site.name,
+          siteAddress:  msg.site.address,
+          booking_date: msg.requestedDate,
+          dates:        [msg.requestedDate],
+          status:       'booked',
+          totalHours:   totalHours,
+          workers_no:   workersOffered,
+        }},
+      });
+      await Message.create({
+        tradePro:      req.userId,
+        site:          msg.site._id,
+        contractor:    msg.contractor,
+        requestedDate: msg.requestedDate,
+        tradeName:     tradeName,
+        workersOffered,
+        status:        'pending',
+        type:          'worker_offer',
+        senderType:    'trade',
+      });
+      console.log(`[approveMessage] worker_offer created — ${pro?.professionality} offering ${workersOffered} workers for "${msg.site.name}"`);
+    } else {
+      // Direct search — no site, but still mark the date in trade's calendar and notify contractor
+      await TradePro.findByIdAndUpdate(req.userId, {
+        $push: { bookings: {
+          siteId:       null,
+          contractorId: msg.contractor?._id ?? msg.contractor ?? null,
+          siteName:     msg.contractor?.companyName || tradeName || 'Direct Request',
+          siteAddress:  '',
+          booking_date: msg.requestedDate,
+          dates:        [msg.requestedDate],
+          status:       'booked',
+          totalHours:   msg.totalHours ?? null,
+          workers_no:   workersOffered,
+        }},
+      });
+      await Message.create({
+        tradePro:      req.userId,
+        site:          null,
+        contractor:    msg.contractor,
+        requestedDate: msg.requestedDate,
+        tradeName:     tradeName,
+        workersOffered,
+        totalHours:    msg.totalHours ?? null,
+        status:        'pending',
+        type:          'worker_offer',
+        senderType:    'trade',
+      });
+      console.log(`[approveMessage] direct-search worker_offer created — ${pro?.professionality} offering ${workersOffered} workers on ${msg.requestedDate}`);
+    }
 
     res.json({ ok: true });
   } catch (err) {
@@ -709,7 +738,7 @@ export async function applyToJob(req, res, next) {
         $pull: { bookings: { siteId: site._id, status: 'order' } },
       });
       await TradePro.findByIdAndUpdate(req.userId, {
-        $push: { bookings: { siteId: site._id, siteName: site.name, siteAddress: site.address, dates, status: 'order' } },
+        $push: { bookings: { siteId: site._id, siteName: site.name, siteAddress: site.address, booking_date: date, dates, status: 'order' } },
       });
     }
 
@@ -811,24 +840,40 @@ export async function checkWorkLog(req, res, next) {
 // as a clean approved-only billing ledger.
 export async function submitWorkLog(req, res, next) {
   try {
-    const { siteId, date, totalSeconds, workers_no } = req.body;
+    const { siteId, contractorId, date, totalSeconds, workers_no } = req.body;
+    console.log(`[submitWorkLog] siteId=${siteId||'(none)'} contractorId=${contractorId||'(none)'} date=${date} totalSeconds=${totalSeconds} workers_no=${workers_no}`);
 
-    if (!siteId || !date || totalSeconds == null) {
-      return res.status(400).json({ message: 'siteId, date and totalSeconds are required' });
+    if (!date || totalSeconds == null) {
+      console.log(`[submitWorkLog] 400 — missing date or totalSeconds`);
+      return res.status(400).json({ message: 'date and totalSeconds are required' });
     }
 
     const totalSec = Number(totalSeconds);
     if (!Number.isFinite(totalSec) || totalSec <= 0) {
+      console.log(`[submitWorkLog] 400 — totalSec=${totalSec} not positive`);
       return res.status(400).json({ message: 'totalSeconds must be a positive number' });
     }
 
-    // Fetch both in parallel — site for contractor ref + name, pro for current hourlyRate
-    const [site, pro] = await Promise.all([
-      Site.findById(siteId).select('contractor').populate('contractor', 'companyName').lean(),
-      TradePro.findById(req.userId).select('hourlyRate').lean(),
-    ]);
+    let site        = null;
+    let contractorDoc = null;
 
-    if (!site) return res.status(404).json({ message: 'Site not found' });
+    if (siteId) {
+      // Normal flow — resolve contractor via site
+      site = await Site.findById(siteId).select('contractor').populate('contractor', 'companyName').lean();
+      if (!site) return res.status(404).json({ message: 'Site not found' });
+      contractorDoc = site.contractor;
+      console.log(`[submitWorkLog] site found, contractor=${contractorDoc?._id}`);
+    } else if (contractorId) {
+      // Direct-search flow — no site, look up contractor directly
+      contractorDoc = await Contractor.findById(contractorId).select('_id companyName').lean();
+      if (!contractorDoc) return res.status(404).json({ message: 'Contractor not found' });
+      console.log(`[submitWorkLog] direct search, contractor=${contractorDoc._id}`);
+    } else {
+      console.log(`[submitWorkLog] 400 — neither siteId nor contractorId provided`);
+      return res.status(400).json({ message: 'siteId or contractorId is required' });
+    }
+
+    const pro = await TradePro.findById(req.userId).select('hourlyRate').lean();
     if (!pro)  return res.status(404).json({ message: 'Trade pro not found' });
 
     const actual_hours  = parseFloat((totalSec / 3600).toFixed(2));
@@ -844,8 +889,8 @@ export async function submitWorkLog(req, res, next) {
     // data is preserved until the contractor acts. type='payment', status drives the colour.
     const workLog = await Message.create({
       tradePro:      req.userId,
-      site:          siteId,
-      contractor:    site.contractor,
+      site:          siteId || null,
+      contractor:    contractorDoc._id,
       requestedDate: date,
       text:          JSON.stringify({ actual_hours, hourly_rate, workers_no: workers_count, order_sum }),
       status:        'pending',
@@ -853,7 +898,7 @@ export async function submitWorkLog(req, res, next) {
       senderType:    'trade',
     });
 
-    const contractorName = site.contractor?.companyName ?? '';
+    const contractorName = contractorDoc?.companyName ?? '';
     res.status(201).json({ workLog, contractorName });
   } catch (err) {
     next(err);
@@ -1085,6 +1130,55 @@ export async function submitContractorGrade(req, res, next) {
     res.status(201).json({ grade: doc, avgGrade: agg?.avg ?? grade, gradeCount: agg?.count ?? 1 });
   } catch (err) {
     if (err.code === 11000) return res.status(409).json({ message: 'Already graded.' });
+    next(err);
+  }
+}
+
+// ── PATCH /trade/working-hours ────────────────────────────────────────────────
+export async function updateWorkingHours(req, res, next) {
+  try {
+    const trade = await TradePro.findByIdAndUpdate(
+      req.userId,
+      { $set: { workingHours: req.body.workingHours } },
+      { new: true }
+    );
+    res.json({ workingHours: trade.workingHours });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /trade/portfolio-photos ──────────────────────────────────────────────
+export async function addPortfolioPhoto(req, res, next) {
+  try {
+    if (!req.file) return res.status(400).json({ message: 'No file uploaded.' });
+    const trade = await TradePro.findById(req.userId);
+    if (!trade) return res.status(404).json({ message: 'Not found.' });
+    if (trade.portfolioPhotos.length >= 5) {
+      return res.status(400).json({ message: 'Maximum 5 portfolio photos allowed.' });
+    }
+    const result = await uploadPhoto(req.file.buffer, 'tradelink/portfolio');
+    trade.portfolioPhotos.push(result.secure_url);
+    await trade.save();
+    res.json({ portfolioPhotos: trade.portfolioPhotos });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── DELETE /trade/portfolio-photos/:index ─────────────────────────────────────
+export async function deletePortfolioPhoto(req, res, next) {
+  try {
+    const idx = Number(req.params.index);
+    const trade = await TradePro.findById(req.userId);
+    if (!trade) return res.status(404).json({ message: 'Not found.' });
+    if (idx < 0 || idx >= trade.portfolioPhotos.length) {
+      return res.status(400).json({ message: 'Invalid photo index.' });
+    }
+    trade.portfolioPhotos.splice(idx, 1);
+    await trade.save();
+    res.json({ portfolioPhotos: trade.portfolioPhotos });
+  } catch (err) {
     next(err);
   }
 }

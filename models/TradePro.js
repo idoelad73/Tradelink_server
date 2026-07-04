@@ -32,15 +32,30 @@ const tradeProSchema = new Schema(
 
     // Job bookings — 'order' when applied, 'booked' after contractor approves
     bookings: [{
-      siteId:      { type: Schema.Types.ObjectId, ref: 'Site', default: null },
-      siteName:    { type: String, default: '' },
-      siteAddress: { type: String, default: '' },
-      dates:       [{ type: String }],   // YYYY-MM-DD for every working day in range
-      status:      { type: String, enum: ['order', 'booked'], default: 'booked' },
-      // Job requirements stored at booking time so the working-hours modal can enforce them
-      totalHours:  { type: Number, default: null }, // minimum hours required for this job
-      workers_no:  { type: Number, default: null }, // workers this trade pro is bringing
+      siteId:       { type: Schema.Types.ObjectId, ref: 'Site',       default: null },
+      contractorId: { type: Schema.Types.ObjectId, ref: 'Contractor', default: null }, // set for direct-search bookings (no site)
+      siteName:     { type: String, default: '' },
+      siteAddress:  { type: String, default: '' },
+      booking_date: { type: String, default: null }, // primary date YYYY-MM-DD — used for availability search
+      dates:        [{ type: String }],              // YYYY-MM-DD for every working day in range
+      status:       { type: String, enum: ['order', 'booked'], default: 'booked' },
+      totalHours:   { type: Number, default: null },
+      workers_no:   { type: Number, default: null },
     }],
+
+    // ── Portfolio photos (up to 5 Cloudinary URLs) ───────────────────────────────
+    portfolioPhotos: [{ type: String }],
+
+    // ── Weekly working hours ──────────────────────────────────────────────────────
+    workingHours: {
+      monday:    { active: { type: Boolean, default: false }, start: { type: String, default: '08:00' }, end: { type: String, default: '17:00' } },
+      tuesday:   { active: { type: Boolean, default: false }, start: { type: String, default: '08:00' }, end: { type: String, default: '17:00' } },
+      wednesday: { active: { type: Boolean, default: false }, start: { type: String, default: '08:00' }, end: { type: String, default: '17:00' } },
+      thursday:  { active: { type: Boolean, default: false }, start: { type: String, default: '08:00' }, end: { type: String, default: '17:00' } },
+      friday:    { active: { type: Boolean, default: false }, start: { type: String, default: '08:00' }, end: { type: String, default: '17:00' } },
+      saturday:  { active: { type: Boolean, default: false }, start: { type: String, default: '08:00' }, end: { type: String, default: '17:00' } },
+      sunday:    { active: { type: Boolean, default: false }, start: { type: String, default: '08:00' }, end: { type: String, default: '17:00' } },
+    },
 
     // ── Trade grades — denormalized averages updated on every new grade ──────────
     avgGrade:   { type: Number, default: null },  // 1.0 – 5.0, null = no grades yet

@@ -23,7 +23,8 @@ const messageSchema = new Schema(
     requestedDate: { type: String, default: '' },   // YYYY-MM-DD
     text:          { type: String, default: '' },
     tradeName:      { type: String,  default: '' }, // e.g. 'Painter' — which trade slot this fills
-    workersOffered: { type: Number,  default: 1  }, // how many workers this TradePro is offering
+    workersOffered: { type: Number,  default: 1    }, // how many workers this TradePro is offering
+    totalHours:     { type: Number,  default: null }, // total job hours — set by contractor on direct-search requests
     min_deposit:    { type: Number,  default: null }, // workersOffered × hourlyRate × totalHours (set on approval)
     order_sum:      { type: Number,  default: null }, // locked sum approved by contractor (actual_hours × rate × workers)
     stripeDepositIntentId: { type: String, default: null },

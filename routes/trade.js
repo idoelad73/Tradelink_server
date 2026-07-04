@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { protect, restrictTo } from '../middleware/auth.js';
 import { photoUpload, handleUploadError } from '../middleware/upload.js';
-import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking, getMyOrders, getMyReceipts, getApprovedOrderDates, checkWorkLog, submitWorkLog, getPaymentApprovedCount, getPaymentApproved, getGradableContractors, uploadContractorGradePhoto, submitContractorGrade, getContractorReviews } from '../controllers/tradeController.js';
+import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking, getMyOrders, getMyReceipts, getApprovedOrderDates, checkWorkLog, submitWorkLog, getPaymentApprovedCount, getPaymentApproved, getGradableContractors, uploadContractorGradePhoto, submitContractorGrade, getContractorReviews, updateWorkingHours, addPortfolioPhoto, deletePortfolioPhoto } from '../controllers/tradeController.js';
 import { createOnboardingLink, completeOnboarding, getStripeStatus } from '../controllers/tradeStripeController.js';
 
 const router = Router();
@@ -29,6 +29,11 @@ router.get('/work-log/check',   checkWorkLog);
 router.post('/work-log',      submitWorkLog);
 router.get('/payment-approved/count', getPaymentApprovedCount);
 router.get('/payment-approved',       getPaymentApproved);
+
+// ── Working hours & portfolio photos ────────────────────────────────────────
+router.patch('/working-hours',              updateWorkingHours);
+router.post('/portfolio-photos',            photoUpload.single('photo'), handleUploadError, addPortfolioPhoto);
+router.delete('/portfolio-photos/:index',   deletePortfolioPhoto);
 
 // ── Contractor grading (by trade pros) ──────────────────────────────────────
 import multer from 'multer';

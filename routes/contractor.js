@@ -4,7 +4,7 @@ import { protect, restrictTo } from '../middleware/auth.js';
 import {
   getMe, updateMe,
   createSite, getSites, getSite, updateSite, deleteSite, findTrades,
-  getTradeBusyDays, askAvailability, getWorkersLeft,
+  getTradeBusyDays, getTradeProProfile, askAvailability, getWorkersLeft,
   getApplications, approveApplication, approveAvailabilityRequest, approveWorkerOffer,
   getNotifications, markNotificationsRead,
   getWorkPlan, updateWorkPlanDate, deleteWorkPlanTrade, requestWorkPlanDate,
@@ -63,6 +63,7 @@ router.post('/trade-grades',                  submitTradeGrade);
 router.post('/sites',       upload.single('photo'), createSite);
 router.get('/sites',        getSites);
 router.get('/trade-pros/:tradeId/busy-days',         getTradeBusyDays);
+router.get('/trade-pros/:tradeId/profile',           getTradeProProfile);
 router.post('/trade-pros/:tradeId/ask-availability', askAvailability);
 router.get('/sites/:siteId/workers-left',            getWorkersLeft);
 router.get('/sites/:siteId/deposit-summary',         getSiteDepositSummary);
