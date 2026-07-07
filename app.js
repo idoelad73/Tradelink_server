@@ -20,7 +20,7 @@ app.post(
 // ── Global middleware ─────────────────────────────────────────────────────────
 app.use(cors({
   origin: (origin, callback) => {
-    if (!origin || origin.startsWith('http://localhost:') || origin === process.env.CLIENT_URL || origin === 'https://trade-link-client-dev.onrender.com') {
+    if (!origin || origin.startsWith('http://localhost:') || origin === process.env.CLIENT_URL || origin === 'https://trade-link-client-dev.onrender.com'||'https://tradelink-dashbpard.onrender.com/') {
       callback(null, true);
     } else {
       callback(new Error('Not allowed by CORS'));
