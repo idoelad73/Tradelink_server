@@ -12,6 +12,11 @@ const contractorSchema = new Schema(
     address:     { type: String, required: true },
     expertise:   [{ type: String }],
 
+    // ── Access level ─────────────────────────────────────────
+    // 'user'  → regular contractor (default)
+    // 'admin' → may sign in to the TradeLink admin dashboard
+    user_type:   { type: String, enum: ['user', 'admin'], default: 'user' },
+
     // ── Sites ─────────────────────────────────────────────────
     sites: [{ type: Schema.Types.ObjectId, ref: 'Site' }],
 

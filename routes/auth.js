@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { registerTrade, registerContractor, loginTrade, loginContractor, forgotPassword, resetPassword } from '../controllers/authController.js';
+import { registerTrade, registerContractor, loginTrade, loginContractor, loginAdmin, forgotPassword, resetPassword } from '../controllers/authController.js';
 import { tradeRegistrationUpload, handleUploadError } from '../middleware/upload.js';
 
 const router = Router();
@@ -18,6 +18,7 @@ router.post('/register/contractor', registerContractor);
 // Login routes — JSON body
 router.post('/login/trade',       loginTrade);
 router.post('/login/contractor',  loginContractor);
+router.post('/login/admin',       loginAdmin);
 
 // Password reset
 router.post('/forgot-password', forgotPassword);

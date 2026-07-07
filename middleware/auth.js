@@ -34,3 +34,12 @@ export function restrictTo(...types) {
     next();
   };
 }
+
+// Requires an authenticated contractor whose user_type === 'admin'.
+// Use after `protect`.
+export function adminOnly(req, res, next) {
+  if (req.userType !== 'contractor' || req.user?.user_type !== 'admin') {
+    return res.status(403).json({ message: 'Access denied — admin account required' });
+  }
+  next();
+}

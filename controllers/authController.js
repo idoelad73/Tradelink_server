@@ -34,6 +34,7 @@ const sendToken = (user, type, statusCode, res, extra = {}) => {
       email: user.email,
       ...(user.fullName    && { fullName: user.fullName }),
       ...(user.companyName && { companyName: user.companyName }),
+      ...(user.user_type   && { user_type: user.user_type }),
       photo: user.photo || null,
     },
     ...extra,
@@ -299,6 +300,34 @@ export async function loginContractor(req, res, next) {
     const user = await Contractor.findOne({ email }).select('+password');
     if (!user || !(await user.comparePassword(password)))
       return res.status(401).json({ message: 'Invalid email or password' });
+
+    await Contractor.findByIdAndUpdate(user._id, {
+      isLoggedIn: true,
+      lastLogin:  new Date(),
+      $inc: { loginCount: 1 },
+    });
+
+    sendToken(user, 'contractor', 200, res);
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/auth/login/admin ────────────────────────────────────────────────
+// Admin dashboard login. Same credentials as a contractor, but only contractors
+// whose user_type === 'admin' are allowed through.
+export async function loginAdmin(req, res, next) {
+  try {
+    const { email, password } = req.body;
+    if (!email || !password)
+      return res.status(400).json({ message: 'Email and password are required' });
+
+    const user = await Contractor.findOne({ email }).select('+password');
+    if (!user || !(await user.comparePassword(password)))
+      return res.status(401).json({ message: 'Invalid email or password' });
+
+    if (user.user_type !== 'admin')
+      return res.status(403).json({ message: 'Access denied — admin account required' });
 
     await Contractor.findByIdAndUpdate(user._id, {
       isLoggedIn: true,
