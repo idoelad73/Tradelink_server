@@ -833,6 +833,59 @@ export async function checkWorkLog(req, res, next) {
   }
 }
 
+// GET /api/trade/deposit-status?contractorId=...&date=...
+// Direct/quick-search bookings only (no siteId). Returns { hasDeposit: bool } —
+// true once the contractor has held a deposit ('payment' + status:'deposited')
+// for this trade + contractor + date. Used to keep the working-hours clock
+// disabled until the deposit actually exists, instead of enabling it as soon
+// as the trade pro approves availability.
+export async function getDepositStatus(req, res, next) {
+  try {
+    const { contractorId, date } = req.query;
+    if (!contractorId || !date) {
+      return res.status(400).json({ message: 'contractorId and date are required' });
+    }
+
+    const existing = await Message.findOne({
+      tradePro:      req.userId,
+      contractor:    contractorId,
+      site:          null,
+      requestedDate: date,
+      type:          'payment',
+      status:        'deposited',
+    }).lean();
+
+    res.json({ hasDeposit: !!existing });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/trade/deposited-requests
+// Bulk list of every direct/quick-search deposit this trade pro has had held —
+// { contractorId, date } pairs. Lets the calendar colour a direct-search booked
+// day correctly (amber = booked, awaiting deposit; red = deposit held) without
+// a round-trip per day.
+export async function getDepositedRequests(req, res, next) {
+  try {
+    const deposits = await Message.find({
+      tradePro: req.userId,
+      site:     null,
+      type:     'payment',
+      status:   'deposited',
+    }).select('contractor requestedDate').lean();
+
+    res.json({
+      deposits: deposits.map(d => ({
+        contractorId: String(d.contractor),
+        date:         d.requestedDate,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // POST /api/trade/work-log
 // Trade pro submits actual hours worked for a booking date.
 // Creates a payment_pending Message — tradehours_orders is ONLY written to when

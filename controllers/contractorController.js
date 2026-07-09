@@ -184,6 +184,15 @@ export async function updateSite(req, res, next) {
     if (status       !== undefined) updates.status  = status;
     if (tradesNeeded !== undefined) updates.tradesNeeded = normalizeTrades(tradesNeeded);
 
+    // Address changed — re-geocode so location.coordinates doesn't go stale
+    if (address !== undefined) {
+      const coords = await geocodeAddress(address);
+      updates.location = {
+        type: 'Point',
+        coordinates: coords ? [parseFloat(coords.lng), parseFloat(coords.lat)] : [0.0, 0.0],
+      };
+    }
+
     if (req.file) {
       const result = await uploadPhoto(req.file.buffer, 'tradelink/sites');
       updates.photo = result.secure_url;
@@ -965,6 +974,64 @@ export async function getSiteDepositSummary(req, res, next) {
   }
 }
 
+// GET /api/contractor/pending-deposits
+// Finds approved worker_offer/approval messages that still require a deposit
+// (min_deposit > 0) but were never paid (depositStatus !== 'held') — e.g. the
+// contractor approved a trade, closed the tab before finishing Stripe checkout,
+// and got stuck. Grouped by site (site-based flow) or by message (direct search).
+export async function getPendingDeposits(req, res, next) {
+  try {
+    const messages = await Message.find({
+      contractor:    req.userId,
+      type:          { $in: ['approval', 'worker_offer'] },
+      status:        'approved',
+      min_deposit:   { $gt: 0 },
+      depositStatus: { $ne: 'held' },
+    })
+      .populate('tradePro', 'fullName professionality hourlyRate')
+      .populate('site', 'name tradesNeeded')
+      .lean();
+
+    const groups = new Map();
+    for (const msg of messages) {
+      const siteId = msg.site?._id ? String(msg.site._id) : null;
+      const key     = siteId ?? `direct:${msg._id}`;
+
+      const tradeSlot = msg.site?.tradesNeeded?.find(
+        (t) => t.name?.toLowerCase() === (msg.tradeName || msg.tradePro?.professionality || '').toLowerCase()
+      );
+
+      const row = {
+        messageId:       String(msg._id),
+        tradeProName:    msg.tradePro?.fullName || '—',
+        professionality: msg.tradePro?.professionality || '—',
+        workers:         msg.workersOffered ?? 1,
+        hourlyRate:      msg.tradePro?.hourlyRate ?? null,
+        totalHours:      tradeSlot?.totalHours ?? msg.totalHours ?? null,
+        min_deposit:     msg.min_deposit,
+      };
+
+      if (!groups.has(key)) {
+        groups.set(key, {
+          key,
+          siteId,
+          messageId: siteId ? null : String(msg._id),
+          siteName:  siteId ? (msg.site?.name || '') : (msg.tradePro?.fullName || 'Direct Request'),
+          rows:      [],
+          total:     0,
+        });
+      }
+      const group = groups.get(key);
+      group.rows.push(row);
+      group.total = parseFloat((group.total + (msg.min_deposit ?? 0)).toFixed(2));
+    }
+
+    res.json({ pending: [...groups.values()] });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // POST /api/contractor/deposit-confirmed
 // Called from client after stripe.confirmPayment succeeds.
 // Verifies the PI hold with Stripe, marks depositStatus='held' on the worker_offer message,
@@ -1387,7 +1454,7 @@ export async function updatePaymentApproval(req, res, next) {
 
     // The "order" is actually a pending payment message
     const pendingMsg = await Message.findOne({ _id: orderId, contractor: req.userId, type: 'payment', status: 'pending' })
-      .populate('tradePro', 'fullName professionality photo hourlyRate stripeAccountId stripeOnboarded')
+      .populate('tradePro', 'fullName professionality photo hourlyRate email stripeAccountId stripeOnboarded')
       .populate('site',     'name address tradesNeeded')   // ← tradesNeeded for min hours
       .lean();
 
@@ -1752,8 +1819,62 @@ export async function updatePaymentApproval(req, res, next) {
 </body></html>`;
 
               await sendMail({ to: contractorEmail, subject, html });
-              await WorkHoursOrder.findByIdAndUpdate(newOrder._id, { receiptSent: true });
               console.log(`[updatePaymentApproval] receipt email sent to ${contractorEmail}`);
+
+              // ── Same-format receipt email to the trade pro — shows their payout, not the full order sum ──
+              const tradeEmail = pendingMsg.tradePro?.email;
+              if (tradeEmail) {
+                const tradeSubject = `🧾 Payment Receipt — ${siteName} — TradeLink`;
+                const tradeHtml = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${tradeSubject}</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
+</head><body>
+<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
+  <div style="background:linear-gradient(135deg,#22c55e,#0ea5e9);padding:28px;text-align:center">
+    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
+    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">Payment Receipt</p>
+  </div>
+  <div style="padding:32px">
+    <p style="color:#0f172a;font-size:15px;margin-bottom:6px">Hi <strong>${tradeName}</strong>,</p>
+    <p style="color:#475569;font-size:14px;line-height:1.6;margin-bottom:28px">Your payment has been processed successfully. Here is your receipt.</p>
+    <div style="background:#f0fdf4;border:2px solid #86efac;border-radius:14px;padding:20px;margin-bottom:24px">
+      <p style="color:#166534;font-size:13px;font-weight:700;margin-bottom:12px;text-transform:uppercase;letter-spacing:.05em">Order Summary</p>
+      <table style="width:100%;border-collapse:collapse">
+        <tr><td style="color:#475569;font-size:13px;padding:4px 0">🏢 Contractor</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${contractor.companyName ?? '—'}</td></tr>
+        <tr><td style="color:#475569;font-size:13px;padding:4px 0">📍 Site</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${siteName}</td></tr>
+        <tr><td style="color:#475569;font-size:13px;padding:4px 0">📅 Date</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${displayDate}</td></tr>
+        <tr><td style="color:#475569;font-size:13px;padding:4px 0">⏱️ Hours</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${newOrder.actual_hours}h</td></tr>
+        <tr><td style="color:#475569;font-size:13px;padding:4px 0">👷 Workers</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${newOrder.workers_no}</td></tr>
+        <tr><td style="color:#475569;font-size:13px;padding:4px 0">💵 Rate</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">$${newOrder.hourly_rate}/hr</td></tr>
+        <tr style="border-top:1.5px solid #86efac">
+          <td style="color:#475569;font-size:13px;padding:8px 0 4px">Order Total</td>
+          <td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right;padding:8px 0 4px">$${lockedSum}</td>
+        </tr>
+        <tr><td style="color:#475569;font-size:13px;padding:4px 0">Platform Fee (${PLATFORM_FEE_PERCENT}%)</td><td style="color:#64748b;font-size:13px;text-align:right">-$${feeDollars}</td></tr>
+      </table>
+    </div>
+    <div style="background:#ecfdf5;border:2px solid #34d399;border-radius:12px;padding:16px;text-align:center;margin-bottom:28px">
+      <p style="color:#065f46;font-size:13px;font-weight:600;margin-bottom:4px">Total Paid to You</p>
+      <p style="color:#065f46;font-size:28px;font-weight:800">$${payoutAmount}</p>
+    </div>
+    <p style="color:#94a3b8;font-size:12px;text-align:center;line-height:1.6">Thank you for using TradeLink. Please keep this email as your payment record.</p>
+  </div>
+  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
+    <p style="color:#94a3b8;font-size:11px">TradeLink · Connecting trade professionals with projects</p>
+  </div>
+</div>
+</body></html>`;
+
+                try {
+                  await sendMail({ to: tradeEmail, subject: tradeSubject, html: tradeHtml });
+                  console.log(`[updatePaymentApproval] trade receipt email sent to ${tradeEmail}`);
+                } catch (tradeEmailErr) {
+                  console.error('[updatePaymentApproval] trade receipt email failed:', tradeEmailErr.message);
+                }
+              }
+
+              await WorkHoursOrder.findByIdAndUpdate(newOrder._id, { receiptSent: true });
             }
           } catch (emailErr) {
             console.error('[updatePaymentApproval] receipt email failed:', emailErr.message);

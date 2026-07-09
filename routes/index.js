@@ -5,6 +5,7 @@ import Contractor   from '../models/Contractor.js';
 import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import Receipt       from '../models/Receipt.js';
 import { protect, adminOnly } from '../middleware/auth.js';
+import { geocodeAddress } from '../utils/geocode.js';
 
 import authRoutes       from './auth.js';
 import contractorRoutes from './contractor.js';
@@ -232,6 +233,15 @@ router.patch('/admin/sites/:id', protect, adminOnly, async (req, res, next) => {
     if (address      !== undefined) update.address      = address;
     if (status       !== undefined) update.status       = status;
     if (tradesNeeded !== undefined) update.tradesNeeded = tradesNeeded;
+
+    // Address changed — re-geocode so location.coordinates doesn't go stale
+    if (address !== undefined) {
+      const coords = await geocodeAddress(address);
+      update.location = {
+        type: 'Point',
+        coordinates: coords ? [parseFloat(coords.lng), parseFloat(coords.lat)] : [0.0, 0.0],
+      };
+    }
 
     const updated = await Site.findByIdAndUpdate(req.params.id, update, { new: true, runValidators: true })
       .select('name type address tradesNeeded photo status')

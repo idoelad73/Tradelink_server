@@ -12,7 +12,7 @@ import {
   getMyOrders, getMyReceipts,
   getPaymentApprovalsCount, getPaymentApprovals, updatePaymentApproval,
   getGradableTrades, submitTradeGrade, uploadGradePhoto, getTradeReviews,
-  getSiteDepositSummary, confirmDeposit,
+  getSiteDepositSummary, confirmDeposit, getPendingDeposits,
 } from '../controllers/contractorController.js';
 
 const upload = multer({
@@ -67,6 +67,7 @@ router.get('/trade-pros/:tradeId/profile',           getTradeProProfile);
 router.post('/trade-pros/:tradeId/ask-availability', askAvailability);
 router.get('/sites/:siteId/workers-left',            getWorkersLeft);
 router.get('/sites/:siteId/deposit-summary',         getSiteDepositSummary);
+router.get('/pending-deposits',                      getPendingDeposits);
 router.post('/deposit-confirmed',                    confirmDeposit);
 router.get('/sites/:id',              getSite);
 router.get('/sites/:id/work-plan',            getWorkPlan);
