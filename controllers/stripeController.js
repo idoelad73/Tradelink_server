@@ -4,6 +4,8 @@ import Contractor     from '../models/Contractor.js';
 import TradePro       from '../models/TradePro.js';
 import Message        from '../models/Message.js';
 import { sendMail }  from '../utils/mailer.js';
+import { contractorReceiptEmail } from '../email_templates/paymentReceipt.js';
+import { contractorReceiptPdf } from '../email_templates/receiptPdf.js';
 
 // Platform fee % read from .env — e.g. STRIPE_PLATFORM_FEE_PERCENT=5  means 5%
 const PLATFORM_FEE_PERCENT = parseFloat(process.env.STRIPE_PLATFORM_FEE_PERCENT ?? '0');
@@ -302,56 +304,26 @@ export async function handleWebhook(req, res) {
               ? new Date(order.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
               : '—';
 
-            const subject = `🧾 Payment Receipt — ${tradeName} · ${siteName} — TradeLink`;
-            const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${subject}</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
-</head><body>
-<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
-  <div style="background:linear-gradient(135deg,#22c55e,#0ea5e9);padding:28px;text-align:center">
-    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
-    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">Payment Receipt</p>
-  </div>
-  <div style="padding:32px">
-    <p style="color:#0f172a;font-size:15px;margin-bottom:6px">Hi <strong>${companyName}</strong>,</p>
-    <p style="color:#475569;font-size:14px;line-height:1.6;margin-bottom:28px">
-      Your payment has been processed successfully. Here is your receipt.
-    </p>
+            const receiptFields = {
+              contractorName: companyName,
+              tradeName,
+              siteName,
+              displayDate,
+              actualHours: order.actual_hours,
+              workersNo:   order.workers_no,
+              hourlyRate:  order.hourly_rate,
+              orderSum:    order.order_sum,
+              feePercent:  PLATFORM_FEE_PERCENT,
+              feeDollars,
+            };
 
-    <div style="background:#f0fdf4;border:2px solid #86efac;border-radius:14px;padding:20px;margin-bottom:24px">
-      <p style="color:#166534;font-size:13px;font-weight:700;margin-bottom:12px;text-transform:uppercase;letter-spacing:.05em">Order Summary</p>
-      <table style="width:100%;border-collapse:collapse">
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">🏗️ Trade Pro</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${tradeName}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">📍 Site</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${siteName}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">📅 Date</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${displayDate}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">⏱️ Hours</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${order.actual_hours}h</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">👷 Workers</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${order.workers_no}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">💵 Rate</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">$${order.hourly_rate}/hr</td></tr>
-        <tr style="border-top:1.5px solid #86efac">
-          <td style="color:#475569;font-size:13px;padding:8px 0 4px">Order Total</td>
-          <td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right;padding:8px 0 4px">$${order.order_sum}</td>
-        </tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">Platform Fee</td><td style="color:#64748b;font-size:13px;text-align:right">$${feeDollars}</td></tr>
-      </table>
-    </div>
+            const { subject, html } = contractorReceiptEmail(receiptFields);
+            const pdf = await contractorReceiptPdf(receiptFields);
 
-    <div style="background:#ecfdf5;border:2px solid #34d399;border-radius:12px;padding:16px;text-align:center;margin-bottom:28px">
-      <p style="color:#065f46;font-size:13px;font-weight:600;margin-bottom:4px">Total Charged</p>
-      <p style="color:#065f46;font-size:28px;font-weight:800">$${totalCharged}</p>
-    </div>
-
-    <p style="color:#94a3b8;font-size:12px;text-align:center;line-height:1.6">
-      Thank you for using TradeLink. Please keep this email as your payment record.
-    </p>
-  </div>
-  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
-    <p style="color:#94a3b8;font-size:11px">TradeLink · Connecting trade professionals with projects</p>
-  </div>
-</div>
-</body></html>`;
-
-            await sendMail({ to: contractorEmail, subject, html });
+            await sendMail({
+              to: contractorEmail, subject, html,
+              attachments: [{ filename: 'TradeLink-Receipt.pdf', content: pdf }],
+            });
             await WorkHoursOrder.findByIdAndUpdate(orderId, { receiptSent: true });
             console.log(`   Email       : receipt sent to ${contractorEmail} ✅`);
           }

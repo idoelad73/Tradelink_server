@@ -35,6 +35,8 @@ import { geocodeAddress } from '../utils/geocode.js';
 import jwt from 'jsonwebtoken';
 import stripe from '../utils/stripe.js';
 import { sendMail } from '../utils/mailer.js';
+import { contractorReceiptEmail, tradeReceiptEmail } from '../email_templates/paymentReceipt.js';
+import { contractorReceiptPdf, tradeReceiptPdf } from '../email_templates/receiptPdf.js';
 
 const PLATFORM_FEE_PERCENT = parseFloat(process.env.STRIPE_PLATFORM_FEE_PERCENT ?? '0');
 
@@ -1776,98 +1778,40 @@ export async function updatePaymentApproval(req, res, next) {
                 ? new Date(newOrder.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
                 : '—';
 
-              const subject = `🧾 Payment Receipt — ${tradeName} · ${siteName} — TradeLink`;
-              const html = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${subject}</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
-</head><body>
-<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
-  <div style="background:linear-gradient(135deg,#22c55e,#0ea5e9);padding:28px;text-align:center">
-    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
-    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">Payment Receipt</p>
-  </div>
-  <div style="padding:32px">
-    <p style="color:#0f172a;font-size:15px;margin-bottom:6px">Hi <strong>${contractor.companyName ?? 'Contractor'}</strong>,</p>
-    <p style="color:#475569;font-size:14px;line-height:1.6;margin-bottom:28px">Your payment has been processed successfully. Here is your receipt.</p>
-    <div style="background:#f0fdf4;border:2px solid #86efac;border-radius:14px;padding:20px;margin-bottom:24px">
-      <p style="color:#166534;font-size:13px;font-weight:700;margin-bottom:12px;text-transform:uppercase;letter-spacing:.05em">Order Summary</p>
-      <table style="width:100%;border-collapse:collapse">
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">🏗️ Trade Pro</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${tradeName}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">📍 Site</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${siteName}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">📅 Date</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${displayDate}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">⏱️ Hours</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${newOrder.actual_hours}h</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">👷 Workers</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${newOrder.workers_no}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">💵 Rate</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">$${newOrder.hourly_rate}/hr</td></tr>
-        <tr style="border-top:1.5px solid #86efac">
-          <td style="color:#475569;font-size:13px;padding:8px 0 4px">Order Total</td>
-          <td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right;padding:8px 0 4px">$${lockedSum}</td>
-        </tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">Platform Fee (${PLATFORM_FEE_PERCENT}%)</td><td style="color:#64748b;font-size:13px;text-align:right">$${feeDollars}</td></tr>
-      </table>
-    </div>
-    <div style="background:#ecfdf5;border:2px solid #34d399;border-radius:12px;padding:16px;text-align:center;margin-bottom:28px">
-      <p style="color:#065f46;font-size:13px;font-weight:600;margin-bottom:4px">Total Charged</p>
-      <p style="color:#065f46;font-size:28px;font-weight:800">$${lockedSum}</p>
-    </div>
-    <p style="color:#94a3b8;font-size:12px;text-align:center;line-height:1.6">Thank you for using TradeLink. Please keep this email as your payment record.</p>
-  </div>
-  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
-    <p style="color:#94a3b8;font-size:11px">TradeLink · Connecting trade professionals with projects</p>
-  </div>
-</div>
-</body></html>`;
+              const receiptFields = {
+                contractorName: contractor.companyName,
+                tradeName,
+                siteName,
+                displayDate,
+                actualHours: newOrder.actual_hours,
+                workersNo:   newOrder.workers_no,
+                hourlyRate:  newOrder.hourly_rate,
+                orderSum:    lockedSum,
+                feePercent:  PLATFORM_FEE_PERCENT,
+                feeDollars,
+              };
 
-              await sendMail({ to: contractorEmail, subject, html });
+              const { subject, html } = contractorReceiptEmail(receiptFields);
+              const contractorPdf = await contractorReceiptPdf({ ...receiptFields, receiptNumber: contractorReceiptNo });
+              await sendMail({
+                to: contractorEmail, subject, html,
+                attachments: [{ filename: `TradeLink-Receipt-${contractorReceiptNo}.pdf`, content: contractorPdf }],
+              });
               console.log(`[updatePaymentApproval] receipt email sent to ${contractorEmail}`);
 
               // ── Same-format receipt email to the trade pro — shows their payout, not the full order sum ──
               const tradeEmail = pendingMsg.tradePro?.email;
               if (tradeEmail) {
-                const tradeSubject = `🧾 Payment Receipt — ${siteName} — TradeLink`;
-                const tradeHtml = `<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${tradeSubject}</title>
-<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f8fafc;padding:24px}</style>
-</head><body>
-<div style="max-width:520px;margin:0 auto;background:#fff;border-radius:20px;overflow:hidden;box-shadow:0 4px 32px rgba(0,0,0,.08)">
-  <div style="background:linear-gradient(135deg,#22c55e,#0ea5e9);padding:28px;text-align:center">
-    <h1 style="color:#fff;font-size:22px;font-weight:800;letter-spacing:-.5px">TradeLink</h1>
-    <p style="color:rgba(255,255,255,.85);font-size:13px;margin-top:4px">Payment Receipt</p>
-  </div>
-  <div style="padding:32px">
-    <p style="color:#0f172a;font-size:15px;margin-bottom:6px">Hi <strong>${tradeName}</strong>,</p>
-    <p style="color:#475569;font-size:14px;line-height:1.6;margin-bottom:28px">Your payment has been processed successfully. Here is your receipt.</p>
-    <div style="background:#f0fdf4;border:2px solid #86efac;border-radius:14px;padding:20px;margin-bottom:24px">
-      <p style="color:#166534;font-size:13px;font-weight:700;margin-bottom:12px;text-transform:uppercase;letter-spacing:.05em">Order Summary</p>
-      <table style="width:100%;border-collapse:collapse">
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">🏢 Contractor</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${contractor.companyName ?? '—'}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">📍 Site</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${siteName}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">📅 Date</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${displayDate}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">⏱️ Hours</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${newOrder.actual_hours}h</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">👷 Workers</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">${newOrder.workers_no}</td></tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">💵 Rate</td><td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right">$${newOrder.hourly_rate}/hr</td></tr>
-        <tr style="border-top:1.5px solid #86efac">
-          <td style="color:#475569;font-size:13px;padding:8px 0 4px">Order Total</td>
-          <td style="color:#0f172a;font-size:13px;font-weight:700;text-align:right;padding:8px 0 4px">$${lockedSum}</td>
-        </tr>
-        <tr><td style="color:#475569;font-size:13px;padding:4px 0">Platform Fee (${PLATFORM_FEE_PERCENT}%)</td><td style="color:#64748b;font-size:13px;text-align:right">-$${feeDollars}</td></tr>
-      </table>
-    </div>
-    <div style="background:#ecfdf5;border:2px solid #34d399;border-radius:12px;padding:16px;text-align:center;margin-bottom:28px">
-      <p style="color:#065f46;font-size:13px;font-weight:600;margin-bottom:4px">Total Paid to You</p>
-      <p style="color:#065f46;font-size:28px;font-weight:800">$${payoutAmount}</p>
-    </div>
-    <p style="color:#94a3b8;font-size:12px;text-align:center;line-height:1.6">Thank you for using TradeLink. Please keep this email as your payment record.</p>
-  </div>
-  <div style="background:#f8fafc;padding:16px;text-align:center;border-top:1px solid #e2e8f0">
-    <p style="color:#94a3b8;font-size:11px">TradeLink · Connecting trade professionals with projects</p>
-  </div>
-</div>
-</body></html>`;
-
+                const { subject: tradeSubject, html: tradeHtml } = tradeReceiptEmail({
+                  ...receiptFields,
+                  payoutAmount,
+                });
                 try {
-                  await sendMail({ to: tradeEmail, subject: tradeSubject, html: tradeHtml });
+                  const tradePdf = await tradeReceiptPdf({ ...receiptFields, payoutAmount, receiptNumber: tradeReceiptNo });
+                  await sendMail({
+                    to: tradeEmail, subject: tradeSubject, html: tradeHtml,
+                    attachments: [{ filename: `TradeLink-Receipt-${tradeReceiptNo}.pdf`, content: tradePdf }],
+                  });
                   console.log(`[updatePaymentApproval] trade receipt email sent to ${tradeEmail}`);
                 } catch (tradeEmailErr) {
                   console.error('[updatePaymentApproval] trade receipt email failed:', tradeEmailErr.message);
