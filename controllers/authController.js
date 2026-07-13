@@ -7,6 +7,7 @@ import Contractor from '../models/Contractor.js';
 import { uploadPhoto, uploadDocument } from '../utils/cloudinary.js';
 import stripe from '../utils/stripe.js';
 import { sendMail } from '../utils/mailer.js';
+import { geocodeAddress } from '../utils/geocode.js';
 
 // Force BSON Double so MongoDB stores as Float64, not Int32
 const toDouble = (v) => new mongoose.mongo.Double(parseFloat(v));
@@ -77,9 +78,22 @@ export async function registerTrade(req, res, next) {
     ]);
 
     const consent = locationConsent === 'true' || locationConsent === true;
-    const lat = parseFloat(latitude);
-    const lng = parseFloat(longitude);
-    const hasCoords = consent && !isNaN(lat) && !isNaN(lng);
+    let lat = parseFloat(latitude);
+    let lng = parseFloat(longitude);
+    let hasCoords = consent && !isNaN(lat) && !isNaN(lng);
+
+    // Fall back to geocoding the registered address (same approach used for
+    // contractor project sites) so trade pros are still searchable even
+    // without live browser geolocation consent.
+    if (!hasCoords) {
+      const fullAddress = [address, city, state, zip].filter(Boolean).join(', ');
+      const geocoded = fullAddress ? await geocodeAddress(fullAddress) : null;
+      if (geocoded) {
+        lat = geocoded.lat;
+        lng = geocoded.lng;
+        hasCoords = true;
+      }
+    }
 
     // ── Stripe Connect — Custom account (no redirect, KYC via API) ──────────
     // bankToken   = btok_... created by Stripe.js — raw account numbers never reach here
