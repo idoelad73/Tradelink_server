@@ -32,6 +32,7 @@ import Counter from '../models/Counter.js';
 import Receipt from '../models/Receipt.js';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
+import { getWorkersCommitted } from '../utils/workerSlots.js';
 import jwt from 'jsonwebtoken';
 import stripe from '../utils/stripe.js';
 import { sendMail } from '../utils/mailer.js';
@@ -242,9 +243,11 @@ export async function getWorkersLeft(req, res, next) {
     const tradeEntry    = site.tradesNeeded?.find((t) => t.name === tradeName);
     const workersNeeded = tradeEntry?.workers_no ?? 0;
 
-    // workers_no IS the remaining slots — it's decremented on approval, not on pending request.
-    // Return it directly so the search bar only reflects approved bookings.
-    res.json({ workersNeeded, workersOffered: 0, workersLeft: workersNeeded, isFull: workersNeeded <= 0 });
+    // workers_no is a fixed total — remaining slots are computed live against
+    // everyone already approved for this site+trade.
+    const alreadyApproved = await getWorkersCommitted(siteId, tradeName);
+    const workersLeft = Math.max(0, workersNeeded - alreadyApproved);
+    res.json({ workersNeeded, workersOffered: alreadyApproved, workersLeft, isFull: workersLeft <= 0 });
   } catch (err) {
     next(err);
   }
@@ -264,14 +267,18 @@ export async function askAvailability(req, res, next) {
     if (!date) return res.status(400).json({ message: 'date is required' });
 
     // ── Check worker slots before doing anything else ─────────────────────
-    // workers_no is decremented on approval, so it's the authoritative remaining count.
+    // workers_no is a fixed total set by the contractor — remaining capacity
+    // is computed live from already-approved messages for this site+trade.
     if (siteId && tradeName) {
       const site = await Site.findById(siteId).select('tradesNeeded').lean();
       const tradeEntry    = site?.tradesNeeded?.find((t) => t.name === tradeName);
-      const workersNeeded = tradeEntry?.workers_no ?? 0;
+      const workersNeeded = tradeEntry?.workers_no ?? null;
 
-      if (workersNeeded <= 0 && tradeEntry) {
-        return res.status(409).json({ slotsFull: true, message: 'All worker slots are filled for this trade and date.' });
+      if (workersNeeded != null) {
+        const alreadyApproved = await getWorkersCommitted(siteId, tradeName);
+        if (alreadyApproved >= workersNeeded) {
+          return res.status(409).json({ slotsFull: true, message: 'All worker slots are filled for this trade and date.' });
+        }
       }
     }
 
@@ -502,23 +509,26 @@ export async function getApplications(req, res, next) {
       .sort({ createdAt: -1 })
       .lean();
 
-    // Build a Set of "tradeProId:date" for already-approved trades
+    // Build a Set of "tradeProId:date:siteId" for already-approved trades — a trade pro
+    // can bring multiple workers and staff a DIFFERENT site on the same date, so the
+    // conflict check must be scoped per site, not just per date.
     const approvedMsgs = await Message.find({
       contractor: req.userId,
       status:     'approved',
       type:       'approval',
-    }).select('tradePro requestedDate').lean();
+    }).select('tradePro requestedDate site').lean();
 
     const bookedKeys = new Set(
       approvedMsgs
         .filter(m => m.tradePro && m.requestedDate)
-        .map(m => `${String(m.tradePro)}:${m.requestedDate}`)
+        .map(m => `${String(m.tradePro)}:${m.requestedDate}:${m.site ? String(m.site) : 'direct'}`)
     );
 
-    // Flag pending applications where that trade pro is already booked on that date
+    // Flag pending applications where that trade pro is already booked for the SAME
+    // site on that date (a different site on the same date is not a conflict).
     const marked = applications.map(app => {
       if (app.status === 'accepted') return app;
-      const key = `${String(app.tradePro?._id)}:${app.requestedDate || ''}`;
+      const key = `${String(app.tradePro?._id)}:${app.requestedDate || ''}:${app.site ? String(app.site?._id ?? app.site) : 'direct'}`;
       return bookedKeys.has(key) ? { ...app, _alreadyBooked: true } : app;
     });
 
@@ -570,28 +580,52 @@ export async function approveWorkerOffer(req, res, next) {
     const tradeSlot = msg.site?.tradesNeeded?.find(
       (t) => t.name?.toLowerCase() === (msg.tradeName || msg.tradePro?.professionality || '').toLowerCase()
     );
+    const professionality = msg.tradePro?.professionality || msg.tradeName;
 
-    const workersOffered     = msg.workersOffered ?? 1;
-    const currentWorkers     = tradeSlot?.workers_no ?? 0;
-    const newWorkersCount    = Math.max(0, currentWorkers - workersOffered);
-    const totalHours         = tradeSlot?.totalHours ?? msg.totalHours ?? null;
-    const hourlyRate         = msg.tradePro?.hourlyRate ?? null;
-    const newTotalWorkingHrs = (tradeSlot?.budgetType === 'hours' && totalHours)
-      ? totalHours * newWorkersCount : null;
+    const workersOffered = msg.workersOffered ?? 1;
+    const totalHours     = tradeSlot?.totalHours ?? msg.totalHours ?? null;
+    const hourlyRate     = msg.tradePro?.hourlyRate ?? null;
 
     const minDeposit = (hourlyRate && totalHours)
       ? parseFloat((workersOffered * hourlyRate * totalHours).toFixed(2))
       : null;
+
+    // A trade pro can bring multiple workers, and different trade pros can
+    // split one slot's need between them — but the total approved across
+    // everyone still can't exceed the site's fixed workers_no for this trade.
+    let slotsRemaining = null;
+    if (tradeSlot?.workers_no != null && msg.site?._id) {
+      const alreadyApproved = await getWorkersCommitted(msg.site._id, professionality);
+      console.log(`[approveWorkerOffer] slot check — messageId=${msg._id} siteId=${msg.site._id} siteName="${msg.site.name}" trade="${professionality}" tradeSlot.workers_no=${tradeSlot.workers_no} alreadyApproved=${alreadyApproved} workersOffered=${workersOffered}`);
+      if (alreadyApproved + workersOffered > tradeSlot.workers_no) {
+        // Dump the raw committed messages behind `alreadyApproved` so a 409 here is debuggable
+        // without needing DB access — shows exactly which records are being counted and why.
+        const committedMsgs = await Message.find({
+          site:      msg.site._id,
+          type:      { $in: ['application', 'worker_offer'] },
+          status:    { $in: ['accepted', 'approved'] },
+          tradeName: { $regex: new RegExp(`^${professionality}$`, 'i') },
+        }).select('_id type status tradePro requestedDate workersOffered').lean();
+        console.log(`[approveWorkerOffer] 409 — committed messages counted toward alreadyApproved=${alreadyApproved}:`,
+          JSON.stringify(committedMsgs.map(m => ({
+            id: String(m._id), type: m.type, status: m.status, tradePro: String(m.tradePro),
+            date: m.requestedDate, workersOffered: m.workersOffered,
+          }))));
+        return res.status(409).json({
+          slotsFull:   true,
+          workersLeft: Math.max(0, tradeSlot.workers_no - alreadyApproved),
+          message:     'Not enough worker slots remaining for this trade.',
+        });
+      }
+      slotsRemaining = Math.max(0, tradeSlot.workers_no - alreadyApproved - workersOffered);
+    }
 
     // Mark message approved + set min_deposit
     msg.status      = 'approved';
     msg.min_deposit = minDeposit;
     await msg.save();
 
-    // Decrement workers_no on the site trade slot
-    const professionality = msg.tradePro?.professionality || msg.tradeName;
-
-    console.log(`[approveWorkerOffer] trade="${professionality}" workersOffered=${workersOffered} slots: ${currentWorkers}→${newWorkersCount}`);
+    console.log(`[approveWorkerOffer] trade="${professionality}" workersOffered=${workersOffered} slotsRemaining=${slotsRemaining}`);
     console.log(`[approveWorkerOffer] msg.requestedDate="${msg.requestedDate}" tradeSlot.requiredDate="${tradeSlot?.requiredDate}"`);
 
     if (professionality && msg.site?._id) {
@@ -599,13 +633,13 @@ export async function approveWorkerOffer(req, res, next) {
       const resolvedDate = msg.requestedDate || tradeSlot?.requiredDate || null;
       console.log(`[approveWorkerOffer] resolvedDate="${resolvedDate}"`);
 
+      // workers_no is a fixed total set by the contractor — it's never
+      // decremented; "assigned" (fully staffed) is derived live instead.
       const siteSet = {
-        'tradesNeeded.$.assigned':   true,
+        'tradesNeeded.$.assigned':   slotsRemaining === null ? true : slotsRemaining <= 0,
         'tradesNeeded.$.tradeProId': msg.tradePro._id,
-        'tradesNeeded.$.workers_no': newWorkersCount,
       };
       if (resolvedDate) siteSet['tradesNeeded.$.requiredDate'] = resolvedDate;
-      if (newTotalWorkingHrs !== null) siteSet['tradesNeeded.$.totalWorkingHrs'] = newTotalWorkingHrs;
 
       console.log('[approveWorkerOffer] siteSet:', JSON.stringify(siteSet));
 
@@ -619,7 +653,7 @@ export async function approveWorkerOffer(req, res, next) {
       console.log(`[approveWorkerOffer] Site.updateOne matched=${updateResult.matchedCount} modified=${updateResult.modifiedCount}`);
     }
 
-    res.json({ ok: true, slotsRemaining: newWorkersCount, siteId: msg.site ? String(msg.site._id) : null, minDeposit, messageId: String(msg._id) });
+    res.json({ ok: true, slotsRemaining, siteId: msg.site ? String(msg.site._id) : null, minDeposit, messageId: String(msg._id) });
   } catch (err) {
     next(err);
   }
@@ -707,12 +741,25 @@ export async function approveApplication(req, res, next) {
 
     if (app.status === 'accepted') return res.json({ message: 'Already approved' });
 
-    // Block if this trade slot is already filled by a different pro
     const tradeSlot = app.site.tradesNeeded?.find(
       (t) => t.name?.toLowerCase() === app.tradePro.professionality?.toLowerCase()
     );
-    if (tradeSlot?.assigned) {
-      return res.status(409).json({ alreadyAssigned: true, message: 'Trade already assigned for this job' });
+
+    // A trade pro can bring multiple workers, and different trade pros can
+    // split one slot's need between them — but the total approved across
+    // everyone still can't exceed the site's fixed workers_no for this trade.
+    const workersOffered = app.workersOffered ?? 1;
+    let slotsRemaining = null;
+    if (tradeSlot?.workers_no != null) {
+      const alreadyApproved = await getWorkersCommitted(app.site._id, app.tradePro.professionality);
+      if (alreadyApproved + workersOffered > tradeSlot.workers_no) {
+        return res.status(409).json({
+          slotsFull:   true,
+          workersLeft: Math.max(0, tradeSlot.workers_no - alreadyApproved),
+          message:     'Not enough worker slots remaining for this trade.',
+        });
+      }
+      slotsRemaining = Math.max(0, tradeSlot.workers_no - alreadyApproved - workersOffered);
     }
 
     app.status = 'accepted';
@@ -721,25 +768,16 @@ export async function approveApplication(req, res, next) {
 
     const finalDate = app.requestedDate || scheduledDate || null;
 
-    // ── Decrement workers_no (same logic as approveAvailabilityRequest) ────────
-    const workersOffered     = app.workersOffered ?? 1;
-    const currentWorkers     = tradeSlot?.workers_no ?? 0;
-    const newWorkersCount    = Math.max(0, currentWorkers - workersOffered);
-    const totalHours         = tradeSlot?.totalHours ?? null;
-    const newTotalWorkingHrs = (tradeSlot?.budgetType === 'hours' && totalHours)
-      ? totalHours * newWorkersCount
-      : null;
-
+    // ── Update site slot. workers_no is a fixed total set by the contractor —
+    // it's never decremented; "assigned" (fully staffed) is derived live from
+    // the messages collection instead.
     const siteUpdate = {
       'tradesNeeded.$.tradeProId': app.tradePro._id,
-      'tradesNeeded.$.workers_no': newWorkersCount,
-      'tradesNeeded.$.assigned':   newWorkersCount <= 0,
+      'tradesNeeded.$.assigned':   slotsRemaining === null ? true : slotsRemaining <= 0,
     };
-    if (newTotalWorkingHrs !== null) siteUpdate['tradesNeeded.$.totalWorkingHrs'] = newTotalWorkingHrs;
     const appResolvedDate = finalDate || tradeSlot?.requiredDate || null;
     if (appResolvedDate) siteUpdate['tradesNeeded.$.requiredDate'] = appResolvedDate;
 
-    // Mark the matching trade slot + decrement remaining worker slots
     await Site.updateOne(
       {
         _id: app.site._id,
@@ -780,14 +818,17 @@ export async function approveApplication(req, res, next) {
     });
     await TradePro.findByIdAndUpdate(app.tradePro._id, { $inc: { availabilityMessages: 1 } });
 
-    // Check messages collection: find any other pending applications from the
-    // same trade pro on the same date so the client can gray them out immediately
+    // Check messages collection: find any other pending applications from the SAME
+    // trade pro for the SAME site + date (a duplicate application to this exact job).
+    // A different site on the same date is NOT a conflict — a trade pro can bring
+    // multiple workers and staff more than one site on the same day.
     const siblingApplicationIds = finalDate
       ? await Message.find({
-          type:    'application',
-          site:    { $in: await Site.find({ contractor: req.userId }).distinct('_id') },
-          tradePro: app.tradePro._id,
-          status:   'pending',
+          type:          'application',
+          site:          app.site._id,
+          tradePro:      app.tradePro._id,
+          requestedDate: finalDate,
+          status:        'pending',
         }).distinct('_id')
       : [];
 
@@ -796,7 +837,7 @@ export async function approveApplication(req, res, next) {
       blockedTradeProId:   String(app.tradePro._id),
       blockedDate:         finalDate || null,
       blockedApplicationIds: siblingApplicationIds.map(String),
-      slotsRemaining:      newWorkersCount,
+      slotsRemaining:      slotsRemaining,
       siteId:              String(app.site._id),
     });
   } catch (err) {
@@ -821,35 +862,38 @@ export async function approveAvailabilityRequest(req, res, next) {
     if (String(msg.site.contractor) !== String(req.userId))
       return res.status(403).json({ message: 'Not authorized' });
 
-    // Block if the trade slot is already assigned to another pro
     const tradeSlot = msg.site.tradesNeeded?.find(
       (t) => t.name?.toLowerCase() === msg.tradePro.professionality?.toLowerCase()
     );
-    if (tradeSlot?.assigned && (tradeSlot.workers_no ?? 1) <= 0) {
-      return res.status(409).json({ alreadyAssigned: true, message: 'Trade already assigned for this job' });
-    }
 
     const finalDate = msg.requestedDate || null;
 
-    // Calculate remaining workers (and total hrs) after this booking
-    const workersOffered     = msg.workersOffered ?? 1;
-    const currentWorkers     = tradeSlot?.workers_no ?? 0;
-    const newWorkersCount    = Math.max(0, currentWorkers - workersOffered);
-    const totalHours         = tradeSlot?.totalHours ?? null;
-    const newTotalWorkingHrs = (tradeSlot?.budgetType === 'hours' && totalHours)
-      ? totalHours * newWorkersCount
-      : null;
+    // A trade pro can bring multiple workers, and different trade pros can
+    // split one slot's need between them — but the total approved across
+    // everyone still can't exceed the site's fixed workers_no for this trade.
+    const workersOffered = msg.workersOffered ?? 1;
+    let slotsRemaining = null;
+    if (tradeSlot?.workers_no != null) {
+      const alreadyApproved = await getWorkersCommitted(msg.site._id, msg.tradePro.professionality);
+      if (alreadyApproved + workersOffered > tradeSlot.workers_no) {
+        return res.status(409).json({
+          slotsFull:   true,
+          workersLeft: Math.max(0, tradeSlot.workers_no - alreadyApproved),
+          message:     'Not enough worker slots remaining for this trade.',
+        });
+      }
+      slotsRemaining = Math.max(0, tradeSlot.workers_no - alreadyApproved - workersOffered);
+    }
 
     // 1. Mark this availability message as accepted
     msg.status = 'accepted';
     await msg.save();
 
-    // 2. Update trade slot: decrement workers_no; mark assigned when fully filled
+    // 2. Update trade slot: mark assigned once fully staffed. workers_no is a
+    //    fixed total set by the contractor, so it's never decremented here.
     const avReqSlotSet = {
-      'tradesNeeded.$.assigned':       true,
-      'tradesNeeded.$.tradeProId':     msg.tradePro._id,
-      'tradesNeeded.$.workers_no':     newWorkersCount,
-      'tradesNeeded.$.totalWorkingHrs': newTotalWorkingHrs,
+      'tradesNeeded.$.assigned':   slotsRemaining === null ? true : slotsRemaining <= 0,
+      'tradesNeeded.$.tradeProId': msg.tradePro._id,
     };
     const avReqResolvedDate = finalDate || tradeSlot?.requiredDate || null;
     if (avReqResolvedDate) avReqSlotSet['tradesNeeded.$.requiredDate'] = avReqResolvedDate;
@@ -902,7 +946,7 @@ export async function approveAvailabilityRequest(req, res, next) {
     });
     await TradePro.findByIdAndUpdate(msg.tradePro._id, { $inc: { availabilityMessages: 1 } });
 
-    res.json({ ok: true, slotsRemaining: newWorkersCount, siteId: String(msg.site._id) });
+    res.json({ ok: true, slotsRemaining, siteId: String(msg.site._id) });
   } catch (err) {
     next(err);
   }

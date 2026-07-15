@@ -9,6 +9,7 @@ import TradeGrade, { GRADE_NAMES_MAP } from '../models/TradeGrade.js';
 import jwt from 'jsonwebtoken';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
+import { getWorkersCommitted } from '../utils/workerSlots.js';
 
 // Force BSON Double so MongoDB stores as Float64, not Int32
 const toDouble = (v) => new mongoose.mongo.Double(parseFloat(v));
@@ -252,21 +253,20 @@ export async function approveBooking(req, res) {
       );
       console.log(`[approveBooking] slot lookup key="${tradeKey}" → ${slot ? `workers_no=${slot.workers_no}` : '⚠️  NOT FOUND'}`);
 
-      const currentWorkers  = slot?.workers_no ?? 0;
-      const newWorkersCount = Math.max(0, currentWorkers - workersOffered);
-      const totalHours      = slot?.totalHours ?? null;
-      const newTotalWorkingHrs = (slot?.budgetType === 'hours' && totalHours)
-        ? totalHours * newWorkersCount : null;
-
-      console.log(`[approveBooking] workers: ${currentWorkers} → ${newWorkersCount} (offered ${workersOffered})`);
+      // workers_no is a fixed total set by the contractor — it's never
+      // decremented; "assigned" (fully staffed) is derived live instead.
+      let isFullyStaffed = true;
+      if (slot?.workers_no != null) {
+        const alreadyApproved = await getWorkersCommitted(resolvedSiteId, tradeKey);
+        isFullyStaffed = alreadyApproved >= slot.workers_no;
+      }
+      console.log(`[approveBooking] isFullyStaffed=${isFullyStaffed}`);
 
       const siteSet = {
-        'tradesNeeded.$.assigned':     true,
+        'tradesNeeded.$.assigned':     isFullyStaffed,
         'tradesNeeded.$.tradeProId':   tradeId,
-        'tradesNeeded.$.workers_no':   newWorkersCount,
         'tradesNeeded.$.requiredDate': date,
       };
-      if (newTotalWorkingHrs !== null) siteSet['tradesNeeded.$.totalWorkingHrs'] = newTotalWorkingHrs;
 
       const updateResult = await Site.updateOne(
         {
@@ -358,6 +358,85 @@ export async function getMessages(req, res, next) {
       .sort({ createdAt: -1 })
       .lean();
     res.json({ messages });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/trade/schedule-bookings
+// Every date commitment for this trade pro, read live from the messages
+// collection (applications, availability requests, worker offers) rather
+// than the tradepros.bookings snapshot — a trade pro can be booked at more
+// than one site on the same date (different workers), and the snapshot only
+// ever holds one entry per date. 'approval' messages are excluded since
+// they're just a notification copy of an 'application'/'availability' that's
+// already counted.
+export async function getScheduleBookings(req, res, next) {
+  try {
+    const [messages, trade] = await Promise.all([
+      Message.find({
+        tradePro: req.userId,
+        type: { $in: ['application', 'availability', 'worker_offer'] },
+        requestedDate: { $nin: [null, ''] },
+      })
+        .populate('site', 'name address')
+        .select('site contractor requestedDate workersOffered totalHours status tradeName type')
+        .lean(),
+      TradePro.findById(req.userId).select('professionality').lean(),
+    ]);
+
+    // approveMessage() always spawns a 'worker_offer' successor the moment an
+    // 'availability' request is approved — the availability record itself never
+    // represents a standalone commitment. Keep only the most authoritative record
+    // per site(+contractor)/date (worker_offer > application/availability) so this
+    // is the single source of truth for BOTH the calendar cell and the action strip —
+    // a 'worker_offer' still pending contractor confirmation correctly shows as
+    // 'pending', not 'booked', even though the trade's own approval already exists.
+    const rank = { worker_offer: 2, application: 1, availability: 1 };
+    const bestByKey = new Map();
+    for (const m of messages) {
+      const key = `${m.site?._id ?? `direct:${m.contractor}`}_${m.requestedDate}_${(m.tradeName || '').toLowerCase()}`;
+      const existing = bestByKey.get(key);
+      if (!existing || (rank[m.type] ?? 0) > (rank[existing.type] ?? 0)) {
+        bestByKey.set(key, m);
+      }
+    }
+
+    // Message.totalHours is only ever set for direct-search requests — for
+    // site-based bookings the minimum-hours guard lives on Site.tradesNeeded,
+    // so it has to be looked up per site+trade (same as getMe() already does
+    // for tradeObj.bookings). Without this, WorkingHoursModal's min-hours
+    // SweetAlert2 never fires for site-based clock lines.
+    const siteIds = [...new Set([...bestByKey.values()].filter(m => m.site?._id).map(m => String(m.site._id)))];
+    const siteHoursMap = {};
+    if (siteIds.length && trade?.professionality) {
+      const sites = await Site.find(
+        { _id: { $in: siteIds } },
+        { 'tradesNeeded.name': 1, 'tradesNeeded.totalHours': 1 }
+      ).lean();
+      for (const site of sites) {
+        const entry = site.tradesNeeded?.find(
+          t => t.name?.toLowerCase() === trade.professionality.toLowerCase()
+        );
+        if (entry) siteHoursMap[String(site._id)] = entry.totalHours ?? null;
+      }
+    }
+
+    const bookings = [...bestByKey.values()].map((m) => {
+      const siteId = m.site?._id ? String(m.site._id) : null;
+      return {
+        date:         m.requestedDate,
+        siteId,
+        siteName:     m.site?.name || m.tradeName || '—',
+        siteAddress:  m.site?.address || '',
+        contractorId: m.contractor ? String(m.contractor) : null,
+        workers:      m.workersOffered ?? 1,
+        totalHours:   siteId ? (siteHoursMap[siteId] ?? null) : (m.totalHours ?? null),
+        status:       ['accepted', 'approved'].includes(m.status) ? 'booked' : 'pending',
+      };
+    });
+
+    res.json({ bookings });
   } catch (err) {
     next(err);
   }
@@ -557,8 +636,8 @@ export async function findJobs(req, res, next) {
       'location.coordinates': [0, 0],
       tradesNeeded: {
         $elemMatch: {
-          name: { $regex: new RegExp(`^${professionality}$`, 'i') },
-          $or: [{ assigned: false }, { workers_no: { $gt: 0 } }],
+          name:     { $regex: new RegExp(`^${professionality}$`, 'i') },
+          assigned: false,
         },
       },
     }).select('_id address');
@@ -587,8 +666,8 @@ export async function findJobs(req, res, next) {
             status: 'active',
             tradesNeeded: {
               $elemMatch: {
-                name: { $regex: new RegExp(`^${professionality}$`, 'i') },
-                $or: [{ assigned: false }, { workers_no: { $gt: 0 } }],
+                name:     { $regex: new RegExp(`^${professionality}$`, 'i') },
+                assigned: false,
               },
             },
           },
@@ -639,7 +718,7 @@ export async function findJobs(req, res, next) {
 
     const results = filtered.map((site) => {
       const trade = site.tradesNeeded.find(
-        (t) => t.name.toLowerCase() === professionality.toLowerCase() && (!t.assigned || t.workers_no > 0)
+        (t) => t.name.toLowerCase() === professionality.toLowerCase() && !t.assigned
       );
       const depositKey    = trade ? `${site._id}::${trade.name}` : null;
       const depositHeld   = depositKey ? depositMap.has(depositKey) : false;
@@ -689,21 +768,21 @@ export async function applyToJob(req, res, next) {
       return res.status(409).json({ assigned: true, siteName: site.name });
     }
 
-    // ── Validate worker slots (same logic as askAvailability) ─────────────────
+    // ── Validate worker slots ──────────────────────────────────────────────
+    // workers_no is a fixed total set by the contractor — remaining capacity
+    // is computed live against everyone else's pending + already-approved
+    // commitments (this trade pro's own prior application to this site is
+    // excluded since it's about to be replaced by this one).
     const workersNeeded  = tradeEntry.workers_no ?? 0;
     const workersOffered = (Number.isFinite(Number(workers_no)) && Number(workers_no) >= 1)
       ? Math.round(Number(workers_no))
       : 1;
 
     if (workersNeeded > 0) {
-      const pendingMsgs = await Message.find({
-        site:       siteId,
-        type:       'application',
-        status:     'pending',
-        tradeName:  { $regex: new RegExp(`^${pro.professionality}$`, 'i') },
-      }).select('workersOffered');
-      const totalPending = pendingMsgs.reduce((s, m) => s + (m.workersOffered || 1), 0);
-      const workersLeft  = Math.max(0, workersNeeded - totalPending);
+      const totalClaimed = await getWorkersCommitted(
+        siteId, pro.professionality, ['accepted', 'approved', 'pending'], req.userId
+      );
+      const workersLeft = Math.max(0, workersNeeded - totalClaimed);
 
       if (workersLeft <= 0) {
         return res.status(409).json({ slotsFull: true, message: 'All worker slots are currently full.' });
@@ -839,21 +918,25 @@ export async function checkWorkLog(req, res, next) {
 // for this trade + contractor + date. Used to keep the working-hours clock
 // disabled until the deposit actually exists, instead of enabling it as soon
 // as the trade pro approves availability.
+// Works for BOTH flows: pass siteId for a site-based (project-card) booking, or
+// contractorId for a direct/quick-search booking (siteId omitted → site:null).
 export async function getDepositStatus(req, res, next) {
   try {
-    const { contractorId, date } = req.query;
-    if (!contractorId || !date) {
-      return res.status(400).json({ message: 'contractorId and date are required' });
+    const { siteId, contractorId, date } = req.query;
+    if (!date || (!siteId && !contractorId)) {
+      return res.status(400).json({ message: 'date and (siteId or contractorId) are required' });
     }
 
-    const existing = await Message.findOne({
+    const query = {
       tradePro:      req.userId,
-      contractor:    contractorId,
-      site:          null,
       requestedDate: date,
       type:          'payment',
       status:        'deposited',
-    }).lean();
+    };
+    if (siteId) query.site = siteId;
+    else        { query.site = null; query.contractor = contractorId; }
+
+    const existing = await Message.findOne(query).lean();
 
     res.json({ hasDeposit: !!existing });
   } catch (err) {
@@ -959,13 +1042,15 @@ export async function submitWorkLog(req, res, next) {
 }
 
 // GET /api/trade/payment-approved/count
-// Badge count — all payment messages (any status) so the trade always sees
-// any activity on their submitted hours.
+// Badge count — only jobs the contractor has actually paid for, i.e. an
+// approved WorkHoursOrder row exists (tradehours_orders collection). Deposit
+// and pending-submission payment Messages don't count — those exist before
+// the job is paid/started and shouldn't light up the "payment approved" icon.
 export async function getPaymentApprovedCount(req, res, next) {
   try {
-    const count = await Message.countDocuments({
-      tradePro: req.userId,
-      type:     'payment',
+    const count = await WorkHoursOrder.countDocuments({
+      trade_id: req.userId,
+      status:   'approved',
     });
     res.json({ count });
   } catch (err) {
