@@ -71,6 +71,10 @@ const workHoursOrderSchema = new Schema(
     payment_sum: { type: Number, default: null }, // amount TradePro receives (order_sum - fee)
     fee_sum:     { type: Number, default: null }, // platform commission amount
     receiptSent: { type: Boolean, default: false }, // true once receipt email sent to contractor
+    // Why a payout could not be sent (bank not connected / unverified / Stripe
+    // rejected). Drives the "check your bank account" prompt on the trade side.
+    payoutBlockedCode:   { type: String, default: null },
+    payoutBlockedReason: { type: String, default: null },
   },
   { timestamps: true, collection: 'tradehours_orders' }
 );

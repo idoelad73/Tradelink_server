@@ -1,5 +1,6 @@
 import stripe   from '../utils/stripe.js';
 import TradePro from '../models/TradePro.js';
+import { isConnectReady } from '../utils/connectStatus.js';
 
 // ── POST /api/trade/stripe/onboard ────────────────────────────────────────────
 // Creates a Stripe Express account for the TradePro (if they don't have one yet)
@@ -78,7 +79,10 @@ export async function getStripeStatus(req, res, next) {
   try {
     const pro = await TradePro.findById(req.userId).select('stripeAccountId stripeOnboarded').lean();
     res.json({
-      onboarded:  pro?.stripeOnboarded  ?? false,
+      // Reconciled against Stripe rather than read straight off the cached flag —
+      // a missed webhook/redirect would otherwise show a fully-onboarded account
+      // as "not connected" indefinitely.
+      onboarded:  await isConnectReady(pro),
       accountId:  pro?.stripeAccountId  ?? null,
     });
   } catch (err) {

@@ -1058,6 +1058,45 @@ export async function getPaymentApprovedCount(req, res, next) {
   }
 }
 
+// GET /api/trade/payout-blocked
+// Approved work whose payout could not be sent because the trade pro's bank
+// details are missing/unverified. Drives the "check your bank account" prompt
+// on the trade dashboard so a stuck payout isn't invisible to the person owed.
+export async function getPayoutBlocked(req, res, next) {
+  try {
+    const blocked = await WorkHoursOrder.find({
+      trade_id:          req.userId,
+      status:            'approved',
+      paymentStatus:     'failed',
+      payoutBlockedCode: { $ne: null },
+    })
+      .populate('site_id', 'name')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    if (!blocked.length) return res.json({ blocked: false });
+
+    const totalOwed = parseFloat(
+      blocked.reduce((sum, o) => sum + (o.payment_sum ?? 0), 0).toFixed(2)
+    );
+
+    res.json({
+      blocked:   true,
+      count:     blocked.length,
+      totalOwed,
+      code:      blocked[0].payoutBlockedCode,
+      reason:    blocked[0].payoutBlockedReason,
+      jobs: blocked.map(o => ({
+        site:   o.site_id?.name ?? '—',
+        date:   o.date,
+        amount: o.payment_sum ?? 0,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // GET /api/trade/payment-approved
 // Returns:
 //   orders   — approved tradehours_orders (clean billing ledger)

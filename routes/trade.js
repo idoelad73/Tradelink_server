@@ -1,7 +1,7 @@
 import { Router } from 'express';
 import { protect, restrictTo } from '../middleware/auth.js';
 import { photoUpload, handleUploadError } from '../middleware/upload.js';
-import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, getScheduleBookings, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking, getMyOrders, getMyReceipts, getApprovedOrderDates, checkWorkLog, getDepositStatus, getDepositedRequests, submitWorkLog, getPaymentApprovedCount, getPaymentApproved, getGradableContractors, uploadContractorGradePhoto, submitContractorGrade, getContractorReviews, updateWorkingHours, addPortfolioPhoto, deletePortfolioPhoto } from '../controllers/tradeController.js';
+import { getMe, updateMe, updateSchedule, updateLocation, approveBooking, getMessages, getScheduleBookings, approveMessage, findJobs, applyToJob, requestReschedule, removeBooking, getMyOrders, getMyReceipts, getApprovedOrderDates, checkWorkLog, getDepositStatus, getDepositedRequests, submitWorkLog, getPaymentApprovedCount, getPaymentApproved, getPayoutBlocked, getGradableContractors, uploadContractorGradePhoto, submitContractorGrade, getContractorReviews, updateWorkingHours, addPortfolioPhoto, deletePortfolioPhoto } from '../controllers/tradeController.js';
 import { createOnboardingLink, completeOnboarding, getStripeStatus } from '../controllers/tradeStripeController.js';
 
 const router = Router();
@@ -31,6 +31,7 @@ router.get('/deposit-status',   getDepositStatus);
 router.get('/deposited-requests', getDepositedRequests);
 router.post('/work-log',      submitWorkLog);
 router.get('/payment-approved/count', getPaymentApprovedCount);
+router.get('/payout-blocked',         getPayoutBlocked);
 router.get('/payment-approved',       getPaymentApproved);
 
 // ── Working hours & portfolio photos ────────────────────────────────────────

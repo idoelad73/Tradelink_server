@@ -37,6 +37,8 @@ import jwt from 'jsonwebtoken';
 import stripe from '../utils/stripe.js';
 import { sendMail } from '../utils/mailer.js';
 import { contractorReceiptEmail, tradeReceiptEmail } from '../email_templates/paymentReceipt.js';
+import { contractorApprovalPendingEmail, tradePayoutBlockedEmail } from '../email_templates/approvalNotice.js';
+import { verifyPayoutReady } from '../utils/payoutReadiness.js';
 import { contractorReceiptPdf, tradeReceiptPdf } from '../email_templates/receiptPdf.js';
 
 const PLATFORM_FEE_PERCENT = parseFloat(process.env.STRIPE_PLATFORM_FEE_PERCENT ?? '0');
@@ -1646,6 +1648,13 @@ export async function updatePaymentApproval(req, res, next) {
     const stripeAccountId = pendingMsg.tradePro?.stripeAccountId ?? null;
     let capturedPiId = null;
     let transferId   = null;
+    // Set when the payout could not be sent — drives the trade pro's
+    // "check your bank account" prompt and suppresses receipt issuance.
+    let payoutBlocked = null;
+    // Non-fatal Stripe problems are collected and returned to the caller rather
+    // than only reaching the server log — approval still succeeds, but the
+    // contractor needs to know the payout didn't actually reach the trade pro.
+    const stripeWarnings = [];
 
     if (lockedSum > 0) {
       const amountCents = Math.round(lockedSum * 100);
@@ -1686,6 +1695,7 @@ export async function updatePaymentApproval(req, res, next) {
           }
         } catch (err) {
           console.error('[updatePaymentApproval] Stripe capture error:', err.message);
+          stripeWarnings.push({ stage: 'capture', message: err.message });
         }
       }
 
@@ -1706,7 +1716,22 @@ export async function updatePaymentApproval(req, res, next) {
       const depositTransfer    = Math.min(payoutAmount, remaining);
       const overageTransfer    = parseFloat((payoutAmount - depositTransfer).toFixed(2));
 
-      if (stripeAccountId && depositTransfer > 0 && sourceChargeId) {
+      // ── Verify the trade pro can actually be paid before moving money ───────
+      // Stripe accepts transfers into accounts that can't pay out, leaving the
+      // funds stuck in their balance with no error. Check first so a bad/absent
+      // bank account becomes an actionable message instead of silent limbo.
+      const readiness = await verifyPayoutReady(stripeAccountId);
+      if (!readiness.ready) {
+        payoutBlocked = readiness;
+        console.log(`[updatePaymentApproval] ⚠️ payout blocked (${readiness.code}) — ${readiness.message}`);
+        stripeWarnings.push({
+          stage:   'payout_blocked',
+          code:    readiness.code,
+          message: `${pendingMsg.tradePro?.fullName ?? 'The trade professional'} could not be paid — ${readiness.message} They have been emailed. The work is approved and the amount is still owed.`,
+        });
+      }
+
+      if (readiness.ready && depositTransfer > 0 && sourceChargeId) {
         try {
           const transfer = await stripe.transfers.create({
             amount:             Math.round(depositTransfer * 100),
@@ -1720,13 +1745,13 @@ export async function updatePaymentApproval(req, res, next) {
           console.log(`[updatePaymentApproval] ✅ deposit transfer $${depositTransfer} → ${stripeAccountId} — transfer_id: ${transferId}`);
         } catch (err) {
           console.error('[updatePaymentApproval] Stripe deposit transfer error:', err.message);
+          stripeWarnings.push({ stage: 'deposit_transfer', message: err.message });
+          payoutBlocked = { code: 'transfer_failed', message: err.message };
         }
-      } else if (!stripeAccountId) {
-        console.log(`[updatePaymentApproval] ⚠️ no stripeAccountId for trade pro — transfer skipped`);
       }
 
       // Overage transfer from the extra PI the contractor just paid
-      if (stripeAccountId && overageTransfer > 0 && overagePiId) {
+      if (readiness.ready && overageTransfer > 0 && overagePiId) {
         try {
           const overagePI      = await stripe.paymentIntents.retrieve(overagePiId);
           const overageCharge  = overagePI.latest_charge ?? null;
@@ -1744,130 +1769,165 @@ export async function updatePaymentApproval(req, res, next) {
           }
         } catch (err) {
           console.error('[updatePaymentApproval] Stripe overage transfer error:', err.message);
+          stripeWarnings.push({ stage: 'overage_transfer', message: err.message });
+          payoutBlocked = payoutBlocked ?? { code: 'transfer_failed', message: err.message };
         }
       }
 
-      // Store Stripe IDs + payment status on the order
-      if (capturedPiId || transferId) {
-        await WorkHoursOrder.findByIdAndUpdate(newOrder._id, {
-          stripePaymentIntentId: capturedPiId,
-          stripeTransferId:      transferId,
-          paymentStatus:         transferId ? 'paid' : 'pending',
-          payment_sum:           transferId ? payoutAmount : null,
-          fee_sum:               transferId ? feeDollars   : null,
-          receiptSent:           false,
-        });
+      // Store Stripe IDs + payment status on the order. Written unconditionally so
+      // a skipped or failed payout is still reflected, instead of leaving the order
+      // blank and indistinguishable from one that was never charged at all.
+      await WorkHoursOrder.findByIdAndUpdate(newOrder._id, {
+        stripePaymentIntentId: capturedPiId,
+        stripeTransferId:      transferId,
+        paymentStatus:         transferId ? 'paid' : (payoutBlocked ? 'failed' : 'pending'),
+        payment_sum:           payoutAmount,
+        fee_sum:               feeDollars,
+        receiptSent:           false,
+        payoutBlockedCode:     transferId ? null : (payoutBlocked?.code    ?? null),
+        payoutBlockedReason:   transferId ? null : (payoutBlocked?.message ?? null),
+      });
 
-        // Create receipt documents + send receipt email when transfer is confirmed
-        if (transferId) {
-          try {
-            const contractor = await Contractor.findById(req.userId).select('companyName email').lean();
-            const contractorEmail = contractor?.email;
-            const tradeName        = pendingMsg.tradePro?.fullName        ?? 'Trade Pro';
-            const tradeProfession  = pendingMsg.tradePro?.professionality ?? '—';
-            const siteDoc          = await Site.findById(siteId).select('name address').lean();
-            const siteName         = siteDoc?.name    ?? '—';
-            const siteAddress      = siteDoc?.address ?? '—';
+      // Receipts are proof that money moved, so they are issued ONLY once Stripe
+      // confirms the payout. Issuing one earlier would burn a sequential receipt
+      // number on a non-payment and produce a duplicate when the payout later
+      // clears. When the payout hasn't settled, both parties get a plain notice
+      // instead — no receipt number consumed, no PDF, no false claim of payment.
+      try {
+        const contractor = await Contractor.findById(req.userId).select('companyName email').lean();
+        const contractorEmail = contractor?.email;
+        const tradeName        = pendingMsg.tradePro?.fullName        ?? 'Trade Pro';
+        const tradeProfession  = pendingMsg.tradePro?.professionality ?? '—';
+        const siteDoc          = await Site.findById(siteId).select('name address').lean();
+        const siteName         = siteDoc?.name    ?? '—';
+        const siteAddress      = siteDoc?.address ?? '—';
+        const tradeEmail       = pendingMsg.tradePro?.email;
+        const displayDate      = newOrder.date
+          ? new Date(newOrder.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
+          : '—';
 
-            // ── Create contractor receipt ──────────────────────────────────
-            const contractorReceiptNo = await nextReceiptNumber('contractor');
-            await Receipt.create({
-              receipt_number:        contractorReceiptNo,
-              receipt_type:          'contractor',
-              order_id:              newOrder._id,
-              contractor_id:         req.userId,
-              trade_id:              pendingMsg.tradePro?._id,
-              site_id:               siteId,
-              contractor_name:       contractor?.companyName ?? '—',
-              trade_name:            tradeName,
-              trade_professionality: tradeProfession,
-              site_name:             siteName,
-              site_address:          siteAddress,
-              date:                  newOrder.date,
-              actual_hours:          newOrder.actual_hours,
-              workers_no:            newOrder.workers_no,
-              hourly_rate:           newOrder.hourly_rate,
-              order_sum:             lockedSum,
-              fee_sum:               feeDollars,
-              payment_sum:           payoutAmount,
-              paymentStatus:         'paid',
+        // ── Payout did NOT settle: notices only, no receipts ────────────
+        if (!transferId) {
+          const reasonMessage = payoutBlocked?.message
+            ?? 'The payment provider has not confirmed the transfer yet.';
+
+          if (contractorEmail) {
+            const { subject, html } = contractorApprovalPendingEmail({
+              contractorName: contractor?.companyName, tradeName, siteName, displayDate,
+              orderSum: lockedSum, reasonMessage,
             });
+            await sendMail({ to: contractorEmail, subject, html });
+            console.log(`[updatePaymentApproval] payout-pending notice sent to ${contractorEmail}`);
+          }
 
-            // ── Create trade receipt ───────────────────────────────────────
-            const tradeReceiptNo = await nextReceiptNumber('trade');
-            await Receipt.create({
-              receipt_number:        tradeReceiptNo,
-              receipt_type:          'trade',
-              order_id:              newOrder._id,
-              contractor_id:         req.userId,
-              trade_id:              pendingMsg.tradePro?._id,
-              site_id:               siteId,
-              contractor_name:       contractor?.companyName ?? '—',
-              trade_name:            tradeName,
-              trade_professionality: tradeProfession,
-              site_name:             siteName,
-              site_address:          siteAddress,
-              date:                  newOrder.date,
-              actual_hours:          newOrder.actual_hours,
-              workers_no:            newOrder.workers_no,
-              hourly_rate:           newOrder.hourly_rate,
-              order_sum:             lockedSum,
-              fee_sum:               feeDollars,
-              payment_sum:           payoutAmount,
-              paymentStatus:         'paid',
-            });
-
-            if (contractorEmail) {
-              const displayDate = newOrder.date
-                ? new Date(newOrder.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
-                : '—';
-
-              const receiptFields = {
-                contractorName: contractor.companyName,
-                tradeName,
-                siteName,
-                displayDate,
-                actualHours: newOrder.actual_hours,
-                workersNo:   newOrder.workers_no,
-                hourlyRate:  newOrder.hourly_rate,
-                orderSum:    lockedSum,
-                feePercent:  PLATFORM_FEE_PERCENT,
-                feeDollars,
-              };
-
-              const { subject, html } = contractorReceiptEmail(receiptFields);
-              const contractorPdf = await contractorReceiptPdf({ ...receiptFields, receiptNumber: contractorReceiptNo });
-              await sendMail({
-                to: contractorEmail, subject, html,
-                attachments: [{ filename: `TradeLink-Receipt-${contractorReceiptNo}.pdf`, content: contractorPdf }],
+          if (tradeEmail) {
+            try {
+              const { subject, html } = tradePayoutBlockedEmail({
+                tradeName, siteName, displayDate, payoutAmount, reasonMessage,
               });
-              console.log(`[updatePaymentApproval] receipt email sent to ${contractorEmail}`);
-
-              // ── Same-format receipt email to the trade pro — shows their payout, not the full order sum ──
-              const tradeEmail = pendingMsg.tradePro?.email;
-              if (tradeEmail) {
-                const { subject: tradeSubject, html: tradeHtml } = tradeReceiptEmail({
-                  ...receiptFields,
-                  payoutAmount,
-                });
-                try {
-                  const tradePdf = await tradeReceiptPdf({ ...receiptFields, payoutAmount, receiptNumber: tradeReceiptNo });
-                  await sendMail({
-                    to: tradeEmail, subject: tradeSubject, html: tradeHtml,
-                    attachments: [{ filename: `TradeLink-Receipt-${tradeReceiptNo}.pdf`, content: tradePdf }],
-                  });
-                  console.log(`[updatePaymentApproval] trade receipt email sent to ${tradeEmail}`);
-                } catch (tradeEmailErr) {
-                  console.error('[updatePaymentApproval] trade receipt email failed:', tradeEmailErr.message);
-                }
-              }
-
-              await WorkHoursOrder.findByIdAndUpdate(newOrder._id, { receiptSent: true });
+              await sendMail({ to: tradeEmail, subject, html });
+              console.log(`[updatePaymentApproval] payout-blocked notice sent to ${tradeEmail}`);
+            } catch (noticeErr) {
+              console.error('[updatePaymentApproval] trade payout notice failed:', noticeErr.message);
+              stripeWarnings.push({ stage: 'trade_notice_email', message: noticeErr.message });
             }
-          } catch (emailErr) {
-            console.error('[updatePaymentApproval] receipt email failed:', emailErr.message);
+          }
+
+        } else {
+          // ── Payout confirmed: issue numbered receipts + receipt emails ──
+          const contractorReceiptNo = await nextReceiptNumber('contractor');
+          await Receipt.create({
+            receipt_number:        contractorReceiptNo,
+            receipt_type:          'contractor',
+            order_id:              newOrder._id,
+            contractor_id:         req.userId,
+            trade_id:              pendingMsg.tradePro?._id,
+            site_id:               siteId,
+            contractor_name:       contractor?.companyName ?? '—',
+            trade_name:            tradeName,
+            trade_professionality: tradeProfession,
+            site_name:             siteName,
+            site_address:          siteAddress,
+            date:                  newOrder.date,
+            actual_hours:          newOrder.actual_hours,
+            workers_no:            newOrder.workers_no,
+            hourly_rate:           newOrder.hourly_rate,
+            order_sum:             lockedSum,
+            fee_sum:               feeDollars,
+            payment_sum:           payoutAmount,
+            paymentStatus:         'paid',
+          });
+
+          const tradeReceiptNo = await nextReceiptNumber('trade');
+          await Receipt.create({
+            receipt_number:        tradeReceiptNo,
+            receipt_type:          'trade',
+            order_id:              newOrder._id,
+            contractor_id:         req.userId,
+            trade_id:              pendingMsg.tradePro?._id,
+            site_id:               siteId,
+            contractor_name:       contractor?.companyName ?? '—',
+            trade_name:            tradeName,
+            trade_professionality: tradeProfession,
+            site_name:             siteName,
+            site_address:          siteAddress,
+            date:                  newOrder.date,
+            actual_hours:          newOrder.actual_hours,
+            workers_no:            newOrder.workers_no,
+            hourly_rate:           newOrder.hourly_rate,
+            order_sum:             lockedSum,
+            fee_sum:               feeDollars,
+            payment_sum:           payoutAmount,
+            paymentStatus:         'paid',
+          });
+
+          if (contractorEmail) {
+            const receiptFields = {
+              contractorName: contractor.companyName,
+              tradeName,
+              siteName,
+              displayDate,
+              actualHours: newOrder.actual_hours,
+              workersNo:   newOrder.workers_no,
+              hourlyRate:  newOrder.hourly_rate,
+              orderSum:    lockedSum,
+              feePercent:  PLATFORM_FEE_PERCENT,
+              feeDollars,
+            };
+
+            const { subject, html } = contractorReceiptEmail(receiptFields);
+            const contractorPdf = await contractorReceiptPdf({ ...receiptFields, receiptNumber: contractorReceiptNo });
+            await sendMail({
+              to: contractorEmail, subject, html,
+              attachments: [{ filename: `TradeLink-Receipt-${contractorReceiptNo}.pdf`, content: contractorPdf }],
+            });
+            console.log(`[updatePaymentApproval] receipt email sent to ${contractorEmail}`);
+
+            // ── Same-format receipt email to the trade pro — shows their payout, not the full order sum ──
+            if (tradeEmail) {
+              const { subject: tradeSubject, html: tradeHtml } = tradeReceiptEmail({
+                ...receiptFields,
+                payoutAmount,
+              });
+              try {
+                const tradePdf = await tradeReceiptPdf({ ...receiptFields, payoutAmount, receiptNumber: tradeReceiptNo });
+                await sendMail({
+                  to: tradeEmail, subject: tradeSubject, html: tradeHtml,
+                  attachments: [{ filename: `TradeLink-Receipt-${tradeReceiptNo}.pdf`, content: tradePdf }],
+                });
+                console.log(`[updatePaymentApproval] trade receipt email sent to ${tradeEmail}`);
+              } catch (tradeEmailErr) {
+                console.error('[updatePaymentApproval] trade receipt email failed:', tradeEmailErr.message);
+                stripeWarnings.push({ stage: 'trade_receipt_email', message: tradeEmailErr.message });
+              }
+            }
+
+            await WorkHoursOrder.findByIdAndUpdate(newOrder._id, { receiptSent: true });
           }
         }
+      } catch (emailErr) {
+        console.error('[updatePaymentApproval] approval email failed:', emailErr.message);
+        stripeWarnings.push({ stage: 'approval_email', message: emailErr.message });
       }
     }
 
@@ -1876,7 +1936,14 @@ export async function updatePaymentApproval(req, res, next) {
       .populate('site_id',  'name address')
       .lean();
 
-    res.json({ deleted: true, _id: orderId, order: populated });
+    res.json({
+      deleted: true,
+      _id:     orderId,
+      order:   populated,
+      // Present only when something went wrong downstream of approval (payout
+      // skipped/failed, receipt email failed). The approval itself succeeded.
+      ...(stripeWarnings.length ? { warnings: stripeWarnings } : {}),
+    });
   } catch (err) {
     next(err);
   }

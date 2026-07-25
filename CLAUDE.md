@@ -20,6 +20,7 @@ All mounted under `/api` in `routes/index.js`:
 ## Dev
 ```bash
 npm run dev    # node --watch server.js
+npm test       # vitest + supertest against in-memory mongo — see tests/README.md
 ```
 
 ## Env

@@ -4,6 +4,7 @@ import Contractor     from '../models/Contractor.js';
 import TradePro       from '../models/TradePro.js';
 import Message        from '../models/Message.js';
 import { sendMail }  from '../utils/mailer.js';
+import { isConnectReady } from '../utils/connectStatus.js';
 import { contractorReceiptEmail } from '../email_templates/paymentReceipt.js';
 import { contractorReceiptPdf } from '../email_templates/receiptPdf.js';
 
@@ -72,7 +73,7 @@ export async function createPaymentIntent(req, res, next) {
     // ── Create PaymentIntent server-side (rule #7) ───────────────────────────
     // application_fee_amount → automatically sent to TradeLink's Stripe platform account
     // transfer_data.destination → sends the remainder to TradePro's connected account
-    const hasConnectAcct = tradePro?.stripeOnboarded && tradePro?.stripeAccountId;
+    const hasConnectAcct = await isConnectReady(tradePro);
 
     const piParams = {
       amount:   amountCents,
