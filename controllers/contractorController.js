@@ -38,6 +38,7 @@ import stripe from '../utils/stripe.js';
 import { sendMail } from '../utils/mailer.js';
 import { contractorReceiptEmail, tradeReceiptEmail } from '../email_templates/paymentReceipt.js';
 import { contractorApprovalPendingEmail, tradePayoutBlockedEmail } from '../email_templates/approvalNotice.js';
+import { contractorDepositHeldEmail, tradeDepositHeldEmail } from '../email_templates/depositHeld.js';
 import { verifyPayoutReady } from '../utils/payoutReadiness.js';
 import { contractorReceiptPdf, tradeReceiptPdf } from '../email_templates/receiptPdf.js';
 
@@ -1145,6 +1146,55 @@ export async function confirmDeposit(req, res, next) {
     console.log(`[confirmDeposit] stripeAmount=$${stripeAmount} stored in deposit message`);
 
     console.log(`[confirmDeposit] ✅ deposit message created _id=${depositMsg._id}`);
+
+    // ── Notify both parties that the deposit is held ────────────────────────
+    // Wrapped so a mail failure can never fail the deposit itself — the hold is
+    // already recorded at Stripe and in the messages collection by this point.
+    try {
+      const [contractorDoc, tradeDoc, siteDoc] = await Promise.all([
+        Contractor.findById(source.contractor).select('companyName email').lean(),
+        TradePro.findById(source.tradePro).select('fullName email').lean(),
+        source.site ? Site.findById(source.site).select('name address').lean() : null,
+      ]);
+
+      // Direct/quick-search deposits carry no site, so fall back to the trade
+      // name the request was raised under rather than printing an empty row.
+      const siteName    = siteDoc?.name ?? source.tradeName ?? null;
+      const siteAddress = siteDoc?.address ?? null;
+      const displayDate = source.requestedDate
+        ? new Date(source.requestedDate + 'T12:00:00').toLocaleDateString('en-US', {
+            weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+          })
+        : null;
+
+      if (contractorDoc?.email) {
+        const { subject, html } = contractorDepositHeldEmail({
+          contractorName: contractorDoc.companyName,
+          tradeName:      tradeDoc?.fullName,
+          siteName,
+          displayDate,
+          amount:         stripeAmount,
+        });
+        await sendMail({ to: contractorDoc.email, subject, html });
+        console.log(`[confirmDeposit] 📧 deposit-held mail sent to contractor ${contractorDoc.email}`);
+      }
+
+      if (tradeDoc?.email) {
+        const { subject, html } = tradeDepositHeldEmail({
+          tradeName:      tradeDoc.fullName,
+          contractorName: contractorDoc?.companyName,
+          siteName,
+          siteAddress,
+          displayDate,
+          amount:         stripeAmount,
+        });
+        await sendMail({ to: tradeDoc.email, subject, html });
+        console.log(`[confirmDeposit] 📧 deposit-held mail sent to trade ${tradeDoc.email}`);
+      }
+    } catch (mailErr) {
+      console.error('[confirmDeposit] deposit-held email failed:', mailErr.message);
+    }
+
     res.json({ ok: true, messageId: String(depositMsg._id) });
   } catch (err) {
     next(err);
@@ -1385,6 +1435,43 @@ export async function getMyReceipts(req, res, next) {
 
     const receipts = await Receipt.find(filter).sort({ createdAt: -1 }).lean();
     res.json({ receipts });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/contractor/receipts/filters
+// Drives the two pickers on the contractor's receipts search bar. Both lists are
+// derived from real documents rather than free text, so the contractor can only
+// filter by values that can actually return a result.
+//   trades — trade pros this contractor has an order with (tradehours_orders),
+//            which is exactly the set that can appear on one of their receipts.
+//   sites  — every project this contractor owns, the same source as the dashboard
+//            project cards (Site.contractor), including ones with no receipt yet.
+export async function getReceiptFilters(req, res, next) {
+  try {
+    const [tradeIds, sites] = await Promise.all([
+      WorkHoursOrder.distinct('trade_id', { contractor_id: req.userId }),
+      Site.find({ contractor: req.userId }).select('name address').sort({ createdAt: -1 }).lean(),
+    ]);
+
+    const tradePros = await TradePro.find({ _id: { $in: tradeIds.filter(Boolean) } })
+      .select('fullName professionality')
+      .sort({ fullName: 1 })
+      .lean();
+
+    res.json({
+      trades: tradePros.map((p) => ({
+        id:              String(p._id),
+        name:            p.fullName,
+        professionality: p.professionality ?? null,
+      })),
+      sites: sites.map((s) => ({
+        id:      String(s._id),
+        name:    s.name,
+        address: s.address ?? '',
+      })),
+    });
   } catch (err) {
     next(err);
   }

@@ -861,6 +861,48 @@ export async function getMyReceipts(req, res, next) {
   }
 }
 
+// GET /api/trade/receipts/filters
+// Drives the two pickers on the trade pro's receipts search bar. Both lists are
+// derived from real documents rather than free text, so the trade pro can only
+// filter by values that can actually return a result.
+// Unlike the contractor side — where sites come from Site.contractor because the
+// contractor owns them — a trade pro owns no sites, so both lists are derived
+// from the orders they actually worked (tradehours_orders). Direct/quick-search
+// orders carry site_id: null and simply contribute no site entry.
+export async function getReceiptFilters(req, res, next) {
+  try {
+    const [contractorIds, siteIds] = await Promise.all([
+      WorkHoursOrder.distinct('contractor_id', { trade_id: req.userId }),
+      WorkHoursOrder.distinct('site_id',       { trade_id: req.userId }),
+    ]);
+
+    const [contractors, sites] = await Promise.all([
+      Contractor.find({ _id: { $in: contractorIds.filter(Boolean) } })
+        .select('companyName')
+        .sort({ companyName: 1 })
+        .lean(),
+      Site.find({ _id: { $in: siteIds.filter(Boolean) } })
+        .select('name address')
+        .sort({ name: 1 })
+        .lean(),
+    ]);
+
+    res.json({
+      contractors: contractors.map((c) => ({
+        id:   String(c._id),
+        name: c.companyName,
+      })),
+      sites: sites.map((s) => ({
+        id:      String(s._id),
+        name:    s.name,
+        address: s.address ?? '',
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
+}
+
 // GET /api/trade/orders — all WorkHoursOrders for this trade pro (receipts)
 export async function getMyOrders(req, res, next) {
   try {

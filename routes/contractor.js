@@ -9,7 +9,7 @@ import {
   getNotifications, markNotificationsRead,
   getWorkPlan, updateWorkPlanDate, deleteWorkPlanTrade, requestWorkPlanDate,
   approveReschedule, declineReschedule,
-  getMyOrders, getMyReceipts,
+  getMyOrders, getMyReceipts, getReceiptFilters,
   getPaymentApprovalsCount, getPaymentApprovals, updatePaymentApproval,
   getGradableTrades, submitTradeGrade, uploadGradePhoto, getTradeReviews,
   getSiteDepositSummary, confirmDeposit, getPendingDeposits,
@@ -45,8 +45,10 @@ router.get('/notifications',       getNotifications);
 router.patch('/notifications/read', markNotificationsRead);
 
 // Orders / receipts
-router.get('/receipts', getMyReceipts);
-router.get('/orders',   getMyOrders);
+// '/receipts/filters' is declared before '/receipts' so it isn't shadowed.
+router.get('/receipts/filters', getReceiptFilters);
+router.get('/receipts',         getMyReceipts);
+router.get('/orders',           getMyOrders);
 
 // Payment approvals (tradehours_orders)
 router.get('/payment-approvals/count',       getPaymentApprovalsCount);
