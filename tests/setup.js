@@ -15,6 +15,9 @@ process.env.STRIPE_PLATFORM_FEE_PERCENT = '10';
 process.env.RESEND_API_KEY              = 're_test_fake';
 process.env.RESEND_FROM_EMAIL           = 'TradeLink <test@example.com>';
 process.env.CLIENT_URL                  = 'http://localhost:5173';
+// The cloudinary mock below returns cdn.test URLs, so that host must be on the
+// grade-photo allowlist for the rating tests to exercise a realistic path.
+process.env.GRADE_PHOTO_HOSTS           = 'res.cloudinary.com,cdn.test';
 
 // ── Module mocks ──────────────────────────────────────────────────────────────
 // Everything that reaches the network is replaced. Paths resolve relative to

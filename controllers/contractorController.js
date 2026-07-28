@@ -1,6 +1,7 @@
 import Contractor from '../models/Contractor.js';
 import Site from '../models/Site.js';
 import TradeGrade, { GRADE_NAMES_MAP } from '../models/TradeGrade.js';
+import { parseGrade, normaliseReviewText, sanitisePhotoUrls, canEditGrade } from '../utils/gradeValidation.js';
 
 // Normalises incoming tradesNeeded — accepts string array OR {name,assigned} object array
 function normalizeTrades(raw) {
@@ -2053,8 +2054,10 @@ export async function getGradableTrades(req, res, next) {
 
     if (!orders.length) return res.json({ trades: [] });
 
-    // Only keep orders where both trade and site are still populated
-    const valid = orders.filter(o => o.trade_id && o.site_id);
+    // The trade pro must still exist — they are the subject of the rating.
+    // The site must NOT be required: direct-search bookings carry site_id: null,
+    // and demanding one made every direct-hire job permanently unratable.
+    const valid = orders.filter(o => o.trade_id);
 
     // Remove orders that have already been graded as 'trade' type (keyed by order_id)
     const existing = await TradeGrade.find({ contractor_id: contractorId, grade_type: 'trade' }).select('order_id').lean();
@@ -2069,8 +2072,8 @@ export async function getGradableTrades(req, res, next) {
         trade_name:      o.trade_id.fullName,
         professionality: o.trade_id.professionality,
         photo:           o.trade_id.photo || null,
-        site_id:         o.site_id._id,
-        site_name:       o.site_id.name,
+        site_id:         o.site_id?._id  ?? null,
+        site_name:       o.site_id?.name ?? null,
       }));
 
     res.json({ trades: gradable });
@@ -2095,35 +2098,70 @@ export async function uploadGradePhoto(req, res, next) {
 // Submit a grade (1–5) with optional review text and photo URLs.
 export async function submitTradeGrade(req, res, next) {
   try {
-    const { trade_id, site_id, order_id, trade_grade, review_text, photos } = req.body;
-    const grade = parseInt(trade_grade, 10);
-    if (!trade_id || !order_id || isNaN(grade) || grade < 1 || grade > 5) {
-      return res.status(400).json({ message: 'trade_id, order_id and trade_grade (1–5) are required.' });
+    const { order_id, trade_grade, review_text, photos } = req.body;
+    const grade = parseGrade(trade_grade);
+    if (!order_id || grade === null) {
+      return res.status(400).json({ message: 'order_id and trade_grade (1–5) are required.' });
     }
 
-    const photoUrls = Array.isArray(photos) ? photos.filter(u => typeof u === 'string' && u.startsWith('http')) : [];
+    const review = normaliseReviewText(review_text);
+    if (!review.ok) return res.status(400).json({ message: review.message });
 
+    // The order is the only source of truth for who may grade whom. Taking
+    // trade_id / site_id from the body instead would let any signed-in
+    // contractor rate any trade pro on a job they had no part in — including a
+    // job that does not exist — which is a review-bombing vector.
+    const order = await WorkHoursOrder.findOne({
+      _id:           order_id,
+      contractor_id: req.userId,
+      status:        'approved',
+    }).lean();
+
+    if (!order) {
+      return res.status(404).json({ message: 'No approved order found for this account.' });
+    }
+
+    // A rating is only editable for a short window after it was first left,
+    // otherwise a score could be quietly rewritten long after the fact.
+    const existing = await TradeGrade.findOne({ order_id: order._id, grade_type: 'trade' }).lean();
+    const editable = canEditGrade(existing);
+    if (!editable.allowed) return res.status(409).json({ message: editable.message });
+
+    const photoUrls = sanitisePhotoUrls(photos);
+
+    // Keyed on (order, direction). Without grade_type in the filter this upsert
+    // matches the trade pro's review OF this contractor for the same order and
+    // silently overwrites it.
     const doc = await TradeGrade.findOneAndUpdate(
-      { contractor_id: req.userId, order_id },
+      { order_id: order._id, grade_type: 'trade' },
       {
-        trade_id, site_id: site_id || null, order_id,
-        grade_type: 'trade',
+        contractor_id: req.userId,
+        trade_id:      order.trade_id,
+        site_id:       order.site_id ?? null,
+        order_id:      order._id,
+        grade_type:   'trade',
         trade_grade: grade, grade_name: GRADE_NAMES_MAP[grade],
-        review_text: (review_text ?? '').trim(),
+        review_text: review.text,
         photos: photoUrls,
         date: new Date(),
+        ...(existing
+          ? { editedAt: new Date(), editCount: (existing.editCount ?? 0) + 1 }
+          : {}),
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
 
-    // Recalculate average and count for this trade across ALL contractors/sites
+    // Recalculate average and count for this trade across ALL contractors/sites.
+    // grade_type is essential: contractor-type rows store trade_id = the pro who
+    // WROTE the review, so without it a pro's public score absorbs the grades
+    // they hand out to contractors.
     const [agg] = await TradeGrade.aggregate([
-      { $match: { trade_id: doc.trade_id } },
+      { $match: { trade_id: doc.trade_id, grade_type: 'trade' } },
       { $group: { _id: '$trade_id', avg: { $avg: '$trade_grade' }, count: { $sum: 1 } } },
     ]);
 
     if (agg) {
-      await TradePro.findByIdAndUpdate(trade_id, {
+      await TradePro.findByIdAndUpdate(doc.trade_id, {
         avgGrade:   Math.round(agg.avg * 10) / 10,  // 1 decimal place, e.g. 4.3
         gradeCount: agg.count,
       });
@@ -2145,7 +2183,9 @@ export async function getTradeReviews(req, res, next) {
 
     const [pro, reviews] = await Promise.all([
       TradePro.findById(tradeId).select('fullName professionality photo avgGrade gradeCount').lean(),
-      TradeGrade.find({ trade_id: tradeId })
+      // grade_type is required: rows this pro wrote ABOUT contractors also carry
+      // trade_id, and without the filter they surface here as reviews OF the pro.
+      TradeGrade.find({ trade_id: tradeId, grade_type: 'trade' })
         .sort({ createdAt: -1 })
         .populate('contractor_id', 'companyName')
         .populate('site_id', 'name')
@@ -2171,6 +2211,8 @@ export async function getTradeReviews(req, res, next) {
         photos:       r.photos ?? [],
         date:         r.date,
         createdAt:    r.createdAt,
+        edited:       (r.editCount ?? 0) > 0,
+        editedAt:     r.editedAt ?? null,
         contractorName: r.contractor_id?.companyName ?? 'Anonymous',
         siteName:       r.site_id?.name ?? null,
       })),

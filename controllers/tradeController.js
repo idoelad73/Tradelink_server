@@ -6,6 +6,7 @@ import Site from '../models/Site.js';
 import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import Receipt from '../models/Receipt.js';
 import TradeGrade, { GRADE_NAMES_MAP } from '../models/TradeGrade.js';
+import { parseGrade, normaliseReviewText, sanitisePhotoUrls, canEditGrade } from '../utils/gradeValidation.js';
 import jwt from 'jsonwebtoken';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
@@ -1280,6 +1281,8 @@ export async function getContractorReviews(req, res, next) {
         photos:      r.photos ?? [],
         createdAt:   r.createdAt,
         date:        r.date,
+        edited:      (r.editCount ?? 0) > 0,
+        editedAt:    r.editedAt ?? null,
         tradeName:   r.trade_id?.fullName ?? 'Unknown',
         tradeProfessionality: r.trade_id?.professionality ?? null,
         siteName:    r.site_id?.name ?? null,
@@ -1306,29 +1309,55 @@ export async function uploadContractorGradePhoto(req, res, next) {
 // Trade pro submits a grade (1–5) for a contractor.
 export async function submitContractorGrade(req, res, next) {
   try {
-    const { contractor_id, site_id, order_id, trade_grade, review_text, photos } = req.body;
-    const grade = parseInt(trade_grade, 10);
-    if (!contractor_id || !order_id || isNaN(grade) || grade < 1 || grade > 5) {
-      return res.status(400).json({ message: 'contractor_id, order_id and trade_grade (1–5) are required.' });
+    const { order_id, trade_grade, review_text, photos } = req.body;
+    const grade = parseGrade(trade_grade);
+    if (!order_id || grade === null) {
+      return res.status(400).json({ message: 'order_id and trade_grade (1–5) are required.' });
     }
 
-    const photoUrls = Array.isArray(photos)
-      ? photos.filter(u => typeof u === 'string' && u.startsWith('http'))
-      : [];
+    const review = normaliseReviewText(review_text);
+    if (!review.ok) return res.status(400).json({ message: review.message });
 
+    // Derive the counterparty from the order rather than trusting the body —
+    // otherwise any signed-in trade pro can rate any contractor, on any job,
+    // including one that never existed.
+    const order = await WorkHoursOrder.findOne({
+      _id:      order_id,
+      trade_id: req.userId,
+      status:   'approved',
+    }).lean();
+
+    if (!order) {
+      return res.status(404).json({ message: 'No approved order found for this account.' });
+    }
+
+    // Ratings lock a short while after submission — see the matching check in
+    // contractorController.submitTradeGrade.
+    const existing = await TradeGrade.findOne({ order_id: order._id, grade_type: 'contractor' }).lean();
+    const editable = canEditGrade(existing);
+    if (!editable.allowed) return res.status(409).json({ message: editable.message });
+
+    const photoUrls = sanitisePhotoUrls(photos);
+
+    // Keyed on (order, direction) — see the matching comment in
+    // contractorController.submitTradeGrade. Dropping grade_type here overwrites
+    // the contractor's review of this trade pro for the same order.
     const doc = await TradeGrade.findOneAndUpdate(
-      { trade_id: req.userId, order_id },
+      { order_id: order._id, grade_type: 'contractor' },
       {
-        trade_id:     req.userId,
-        contractor_id,
-        site_id:      site_id || null,
-        order_id,
+        trade_id:      req.userId,
+        contractor_id: order.contractor_id,
+        site_id:       order.site_id ?? null,
+        order_id:      order._id,
         grade_type:   'contractor',
         trade_grade:  grade,
         grade_name:   GRADE_NAMES_MAP[grade],
-        review_text:  (review_text ?? '').trim(),
+        review_text:  review.text,
         photos:       photoUrls,
         date:         new Date(),
+        ...(existing
+          ? { editedAt: new Date(), editCount: (existing.editCount ?? 0) + 1 }
+          : {}),
       },
       { upsert: true, new: true, setDefaultsOnInsert: true }
     );
@@ -1340,7 +1369,7 @@ export async function submitContractorGrade(req, res, next) {
     ]);
 
     if (agg) {
-      await Contractor.findByIdAndUpdate(contractor_id, {
+      await Contractor.findByIdAndUpdate(doc.contractor_id, {
         avgGrade:   Math.round(agg.avg * 10) / 10,
         gradeCount: agg.count,
       });
