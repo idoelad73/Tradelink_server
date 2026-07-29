@@ -61,9 +61,20 @@ function computeWorkingRange(startDateStr, totalHours) {
 // GET /api/trade/me
 export async function getMe(req, res, next) {
   try {
+    // Badge count = items still awaiting this trade pro's action. The status
+    // filter matters: without it an availability request the trade pro already
+    // approved kept counting forever, so the navbar badge never cleared. Note
+    // 'approval' messages are born status:'approved' (they're contractor→trade
+    // notices, not requests), so they correctly never contribute to the badge.
+    // getMessages() still returns every status — the modal needs the approved
+    // ones both to show history and to derive its same-site/date conflict set.
     const [trade, messageCount] = await Promise.all([
       TradePro.findById(req.userId),
-      Message.countDocuments({ tradePro: req.userId, type: { $in: ['availability', 'approval'] } }),
+      Message.countDocuments({
+        tradePro: req.userId,
+        type:     { $in: ['availability', 'approval'] },
+        status:   'pending',
+      }),
     ]);
 
     const tradeObj = trade.toObject();
