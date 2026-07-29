@@ -66,6 +66,8 @@ beforeEach(async () => {
   const collections = await mongoose.connection.db.collections();
   await Promise.all(collections.map(c => c.deleteMany({})));
 
-  sendMail.mockClear();
+  // mockReset, not mockClear: mockClear only wipes call history, so a
+  // mockRejectedValue set by one test would still be in force for the next.
+  sendMail.mockReset().mockResolvedValue({ id: 'email_test' });
   resetStripeMock();
 });

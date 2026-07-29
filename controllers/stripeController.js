@@ -3,10 +3,8 @@ import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import Contractor     from '../models/Contractor.js';
 import TradePro       from '../models/TradePro.js';
 import Message        from '../models/Message.js';
-import { sendMail }  from '../utils/mailer.js';
 import { isConnectReady } from '../utils/connectStatus.js';
-import { contractorReceiptEmail } from '../email_templates/paymentReceipt.js';
-import { contractorReceiptPdf } from '../email_templates/receiptPdf.js';
+import { issueOrderReceipts } from '../utils/receipts.js';
 
 // Platform fee % read from .env — e.g. STRIPE_PLATFORM_FEE_PERCENT=5  means 5%
 const PLATFORM_FEE_PERCENT = parseFloat(process.env.STRIPE_PLATFORM_FEE_PERCENT ?? '0');
@@ -288,45 +286,35 @@ export async function handleWebhook(req, res) {
           });
           console.log(`   DB          : paymentStatus → paid ✅  |  payment_sum=$${payoutDollars}  fee_sum=$${feeDollars}`);
 
-          // Send receipt email to contractor
+          // Issue receipts through the shared path so this route produces the
+          // same numbered, ledger-backed records as the approval flow. This
+          // branch used to send a lone unnumbered PDF to the contractor and
+          // write nothing to the Receipt collection, so what a contractor ended
+          // up holding depended on which payment route they took.
           const order = await WorkHoursOrder.findById(orderId)
             .populate('contractor_id', 'companyName email')
-            .populate('trade_id',      'fullName')
-            .populate('site_id',       'name')
+            .populate('trade_id',      'fullName professionality email')
+            .populate('site_id',       'name address')
             .lean();
 
-          const contractorEmail = order?.contractor_id?.email;
-          if (contractorEmail) {
-            const companyName    = order.contractor_id?.companyName ?? 'Contractor';
-            const tradeName      = order.trade_id?.fullName ?? 'Trade Pro';
-            const siteName       = order.site_id?.name ?? '—';
-            const totalCharged   = orderSum;
-            const displayDate    = order.date
-              ? new Date(order.date + 'T12:00:00').toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })
-              : '—';
+          const issued = await issueOrderReceipts({
+            order,
+            contractor:   order?.contractor_id,
+            tradePro:     order?.trade_id,
+            site:         order?.site_id,
+            orderSum,
+            feeDollars,
+            payoutAmount: payoutDollars,
+            feePercent:   PLATFORM_FEE_PERCENT,
+          });
 
-            const receiptFields = {
-              contractorName: companyName,
-              tradeName,
-              siteName,
-              displayDate,
-              actualHours: order.actual_hours,
-              workersNo:   order.workers_no,
-              hourlyRate:  order.hourly_rate,
-              orderSum:    order.order_sum,
-              feePercent:  PLATFORM_FEE_PERCENT,
-              feeDollars,
-            };
-
-            const { subject, html } = contractorReceiptEmail(receiptFields);
-            const pdf = await contractorReceiptPdf(receiptFields);
-
-            await sendMail({
-              to: contractorEmail, subject, html,
-              attachments: [{ filename: 'TradeLink-Receipt.pdf', content: pdf }],
-            });
-            await WorkHoursOrder.findByIdAndUpdate(orderId, { receiptSent: true });
-            console.log(`   Email       : receipt sent to ${contractorEmail} ✅`);
+          if (issued.skipped) {
+            console.log(`   Receipts    : already issued for this order — nothing sent`);
+          } else {
+            if (issued.contractor?.ok) {
+              await WorkHoursOrder.findByIdAndUpdate(orderId, { receiptSent: true });
+            }
+            console.log(`   Receipts    : contractor=${issued.contractor?.ok ? '✅' : '❌'} trade=${issued.trade?.ok ? '✅' : '❌'}`);
           }
         }
         break;

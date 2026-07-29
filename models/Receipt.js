@@ -21,6 +21,18 @@ const receiptSchema = new mongoose.Schema({
   fee_sum:               Number,
   payment_sum:           Number,
   paymentStatus:         { type: String, default: 'paid' },
+
+  // ── Delivery tracking ──────────────────────────────────────────────────────
+  // A receipt number is allocated because the money moved, so the document is
+  // genuinely owed — but that says nothing about whether it reached anyone.
+  // Recording the outcome keeps the ledger honest and gives a retry something
+  // to select on, instead of a row that silently implies "sent".
+  emailedAt:     { type: Date,    default: null },  // null = never delivered
+  deliveryError: { type: String,  default: null },  // last failure reason
+  pdfAttached:   { type: Boolean, default: false }, // false = sent without the PDF
 }, { timestamps: true });
+
+// Receipts still owed to someone — drives any resend/repair pass.
+receiptSchema.index({ emailedAt: 1, createdAt: -1 });
 
 export default mongoose.model('Receipt', receiptSchema);

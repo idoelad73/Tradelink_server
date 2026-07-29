@@ -23,7 +23,17 @@ export const stripeMock = {
   accountLinks: {
     create: vi.fn(),
   },
+  webhooks: {
+    // Signature verification is Stripe's job, not ours — tests drive the event
+    // payload directly via `stripeWebhookEvent()` below.
+    constructEvent: vi.fn(),
+  },
 };
+
+/** Makes the next webhook POST deliver `event`. */
+export function stripeWebhookEvent(event) {
+  stripeMock.webhooks.constructEvent.mockReturnValue(event);
+}
 
 /** A connected account Stripe considers able to receive payouts. */
 export const PAYOUT_READY_ACCOUNT = {
@@ -61,6 +71,11 @@ export function resetStripeMock() {
     id:            'pi_test_deposit',
     status:        'succeeded',
     latest_charge: 'ch_test_deposit',
+  });
+
+  // No default event — a webhook test must state which one it is sending.
+  stripeMock.webhooks.constructEvent.mockReset().mockImplementation(() => {
+    throw new Error('No webhook event configured — call stripeWebhookEvent() first');
   });
 }
 

@@ -2,6 +2,8 @@ import Contractor from '../models/Contractor.js';
 import Site from '../models/Site.js';
 import TradeGrade, { GRADE_NAMES_MAP } from '../models/TradeGrade.js';
 import { parseGrade, normaliseReviewText, sanitisePhotoUrls, canEditGrade } from '../utils/gradeValidation.js';
+import { deliverMail, deliverMailWarning } from '../utils/safeMail.js';
+import { issueOrderReceipts } from '../utils/receipts.js';
 
 // Normalises incoming tradesNeeded — accepts string array OR {name,assigned} object array
 function normalizeTrades(raw) {
@@ -29,32 +31,18 @@ function normalizeTrades(raw) {
 import TradePro from '../models/TradePro.js';
 import Message from '../models/Message.js';
 import WorkHoursOrder from '../models/WorkHoursOrder.js';
-import Counter from '../models/Counter.js';
 import Receipt from '../models/Receipt.js';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
 import { getWorkersCommitted } from '../utils/workerSlots.js';
 import jwt from 'jsonwebtoken';
 import stripe from '../utils/stripe.js';
-import { sendMail } from '../utils/mailer.js';
-import { contractorReceiptEmail, tradeReceiptEmail } from '../email_templates/paymentReceipt.js';
 import { contractorApprovalPendingEmail, tradePayoutBlockedEmail } from '../email_templates/approvalNotice.js';
 import { contractorDepositHeldEmail, tradeDepositHeldEmail } from '../email_templates/depositHeld.js';
 import { verifyPayoutReady } from '../utils/payoutReadiness.js';
-import { contractorReceiptPdf, tradeReceiptPdf } from '../email_templates/receiptPdf.js';
 
 const PLATFORM_FEE_PERCENT = parseFloat(process.env.STRIPE_PLATFORM_FEE_PERCENT ?? '0');
 
-async function nextReceiptNumber(type) {
-  const prefix    = type === 'contractor' ? 'C' : 'T';
-  const counterId = `${type}_receipt`;
-  const counter   = await Counter.findOneAndUpdate(
-    { _id: counterId },
-    { $inc: { seq: 1 } },
-    { new: true, upsert: true }
-  );
-  return prefix + String(counter.seq).padStart(6, '0');
-}
 
 // GET /api/contractor/me
 // Returns contractor profile + count of sites
@@ -1129,23 +1117,42 @@ export async function confirmDeposit(req, res, next) {
     // Use Stripe's amount as the authoritative deposit sum (pi.amount is in cents)
     const stripeAmount = pi.amount / 100;
 
-    // Create the deposit record message
-    const depositMsg = await Message.create({
-      tradePro:      source.tradePro,
-      site:          source.site,
-      contractor:    source.contractor,
-      requestedDate: source.requestedDate,
-      tradeName:     source.tradeName,
-      workersOffered: source.workersOffered,
-      min_deposit:   stripeAmount,
-      stripeDepositIntentId: paymentIntentId,
-      depositStatus: 'held',
-      type:          'payment',
-      status:        'deposited',
-      senderType:    'contractor',
-    });
-    console.log(`[confirmDeposit] stripeAmount=$${stripeAmount} stored in deposit message`);
+    // Create the deposit record — upsert keyed on the PaymentIntent so a retry,
+    // refresh or double-click cannot record the same hold twice. A duplicate
+    // would also corrupt the overage maths later, since the remaining-deposit
+    // calculation reads a single `deposited` message per site.
+    const upserted = await Message.findOneAndUpdate(
+      {
+        contractor:            source.contractor,
+        stripeDepositIntentId: paymentIntentId,
+        type:                  'payment',
+        status:                'deposited',
+      },
+      {
+        $setOnInsert: {
+          tradePro:       source.tradePro,
+          site:           source.site,
+          requestedDate:  source.requestedDate,
+          tradeName:      source.tradeName,
+          workersOffered: source.workersOffered,
+          min_deposit:    stripeAmount,
+          depositStatus:  'held',
+          senderType:     'contractor',
+        },
+      },
+      { upsert: true, new: true, setDefaultsOnInsert: true, includeResultMetadata: true }
+    );
 
+    const depositMsg = upserted.value;
+
+    // Already recorded by an earlier call — return the same id and, crucially,
+    // do not send the deposit-held emails a second time.
+    if (upserted.lastErrorObject?.updatedExisting) {
+      console.log(`[confirmDeposit] ↩️ deposit already recorded _id=${depositMsg._id} — skipping duplicate notification`);
+      return res.json({ ok: true, messageId: String(depositMsg._id), alreadyProcessed: true });
+    }
+
+    console.log(`[confirmDeposit] stripeAmount=$${stripeAmount} stored in deposit message`);
     console.log(`[confirmDeposit] ✅ deposit message created _id=${depositMsg._id}`);
 
     // ── Notify both parties that the deposit is held ────────────────────────
@@ -1168,30 +1175,33 @@ export async function confirmDeposit(req, res, next) {
           })
         : null;
 
-      if (contractorDoc?.email) {
-        const { subject, html } = contractorDepositHeldEmail({
-          contractorName: contractorDoc.companyName,
+      // Delivered independently — these two shared a try block, so a failure on
+      // the contractor's mail cancelled the trade pro's. The trade pro's copy is
+      // their signal that the job is funded and they are clear to start work.
+      await deliverMail({
+        to:    contractorDoc?.email,
+        stage: 'deposit_held_contractor',
+        build: () => contractorDepositHeldEmail({
+          contractorName: contractorDoc?.companyName,
           tradeName:      tradeDoc?.fullName,
           siteName,
           displayDate,
           amount:         stripeAmount,
-        });
-        await sendMail({ to: contractorDoc.email, subject, html });
-        console.log(`[confirmDeposit] 📧 deposit-held mail sent to contractor ${contractorDoc.email}`);
-      }
+        }),
+      });
 
-      if (tradeDoc?.email) {
-        const { subject, html } = tradeDepositHeldEmail({
-          tradeName:      tradeDoc.fullName,
+      await deliverMail({
+        to:    tradeDoc?.email,
+        stage: 'deposit_held_trade',
+        build: () => tradeDepositHeldEmail({
+          tradeName:      tradeDoc?.fullName,
           contractorName: contractorDoc?.companyName,
           siteName,
           siteAddress,
           displayDate,
           amount:         stripeAmount,
-        });
-        await sendMail({ to: tradeDoc.email, subject, html });
-        console.log(`[confirmDeposit] 📧 deposit-held mail sent to trade ${tradeDoc.email}`);
-      }
+        }),
+      });
     } catch (mailErr) {
       console.error('[confirmDeposit] deposit-held email failed:', mailErr.message);
     }
@@ -1899,117 +1909,45 @@ export async function updatePaymentApproval(req, res, next) {
           const reasonMessage = payoutBlocked?.message
             ?? 'The payment provider has not confirmed the transfer yet.';
 
-          if (contractorEmail) {
-            const { subject, html } = contractorApprovalPendingEmail({
+          // Delivered independently. The trade pro's notice is the whole point
+          // of this branch — it is the only thing telling them their payout is
+          // stuck — so it must not depend on the contractor's send succeeding.
+          await deliverMailWarning({
+            to:    contractorEmail,
+            stage: 'contractor_notice_email',
+            build: () => contractorApprovalPendingEmail({
               contractorName: contractor?.companyName, tradeName, siteName, displayDate,
               orderSum: lockedSum, reasonMessage,
-            });
-            await sendMail({ to: contractorEmail, subject, html });
-            console.log(`[updatePaymentApproval] payout-pending notice sent to ${contractorEmail}`);
-          }
+            }),
+          }, stripeWarnings);
 
-          if (tradeEmail) {
-            try {
-              const { subject, html } = tradePayoutBlockedEmail({
-                tradeName, siteName, displayDate, payoutAmount, reasonMessage,
-              });
-              await sendMail({ to: tradeEmail, subject, html });
-              console.log(`[updatePaymentApproval] payout-blocked notice sent to ${tradeEmail}`);
-            } catch (noticeErr) {
-              console.error('[updatePaymentApproval] trade payout notice failed:', noticeErr.message);
-              stripeWarnings.push({ stage: 'trade_notice_email', message: noticeErr.message });
-            }
-          }
+          await deliverMailWarning({
+            to:    tradeEmail,
+            stage: 'trade_notice_email',
+            build: () => tradePayoutBlockedEmail({
+              tradeName, siteName, displayDate, payoutAmount, reasonMessage,
+            }),
+          }, stripeWarnings);
 
         } else {
           // ── Payout confirmed: issue numbered receipts + receipt emails ──
-          const contractorReceiptNo = await nextReceiptNumber('contractor');
-          await Receipt.create({
-            receipt_number:        contractorReceiptNo,
-            receipt_type:          'contractor',
-            order_id:              newOrder._id,
-            contractor_id:         req.userId,
-            trade_id:              pendingMsg.tradePro?._id,
-            site_id:               siteId,
-            contractor_name:       contractor?.companyName ?? '—',
-            trade_name:            tradeName,
-            trade_professionality: tradeProfession,
-            site_name:             siteName,
-            site_address:          siteAddress,
-            date:                  newOrder.date,
-            actual_hours:          newOrder.actual_hours,
-            workers_no:            newOrder.workers_no,
-            hourly_rate:           newOrder.hourly_rate,
-            order_sum:             lockedSum,
-            fee_sum:               feeDollars,
-            payment_sum:           payoutAmount,
-            paymentStatus:         'paid',
+          // Shared with the Stripe webhook so both payment routes produce the
+          // same numbered, ledger-backed record. See utils/receipts.js.
+          const issued = await issueOrderReceipts({
+            order:        newOrder,
+            contractor:   contractor ?? { _id: req.userId },
+            tradePro:     pendingMsg.tradePro,
+            site:         siteDoc,
+            siteId,
+            orderSum:     lockedSum,
+            feeDollars,
+            payoutAmount,
+            feePercent:   PLATFORM_FEE_PERCENT,
+            warnings:     stripeWarnings,
           });
 
-          const tradeReceiptNo = await nextReceiptNumber('trade');
-          await Receipt.create({
-            receipt_number:        tradeReceiptNo,
-            receipt_type:          'trade',
-            order_id:              newOrder._id,
-            contractor_id:         req.userId,
-            trade_id:              pendingMsg.tradePro?._id,
-            site_id:               siteId,
-            contractor_name:       contractor?.companyName ?? '—',
-            trade_name:            tradeName,
-            trade_professionality: tradeProfession,
-            site_name:             siteName,
-            site_address:          siteAddress,
-            date:                  newOrder.date,
-            actual_hours:          newOrder.actual_hours,
-            workers_no:            newOrder.workers_no,
-            hourly_rate:           newOrder.hourly_rate,
-            order_sum:             lockedSum,
-            fee_sum:               feeDollars,
-            payment_sum:           payoutAmount,
-            paymentStatus:         'paid',
-          });
-
-          if (contractorEmail) {
-            const receiptFields = {
-              contractorName: contractor.companyName,
-              tradeName,
-              siteName,
-              displayDate,
-              actualHours: newOrder.actual_hours,
-              workersNo:   newOrder.workers_no,
-              hourlyRate:  newOrder.hourly_rate,
-              orderSum:    lockedSum,
-              feePercent:  PLATFORM_FEE_PERCENT,
-              feeDollars,
-            };
-
-            const { subject, html } = contractorReceiptEmail(receiptFields);
-            const contractorPdf = await contractorReceiptPdf({ ...receiptFields, receiptNumber: contractorReceiptNo });
-            await sendMail({
-              to: contractorEmail, subject, html,
-              attachments: [{ filename: `TradeLink-Receipt-${contractorReceiptNo}.pdf`, content: contractorPdf }],
-            });
-            console.log(`[updatePaymentApproval] receipt email sent to ${contractorEmail}`);
-
-            // ── Same-format receipt email to the trade pro — shows their payout, not the full order sum ──
-            if (tradeEmail) {
-              const { subject: tradeSubject, html: tradeHtml } = tradeReceiptEmail({
-                ...receiptFields,
-                payoutAmount,
-              });
-              try {
-                const tradePdf = await tradeReceiptPdf({ ...receiptFields, payoutAmount, receiptNumber: tradeReceiptNo });
-                await sendMail({
-                  to: tradeEmail, subject: tradeSubject, html: tradeHtml,
-                  attachments: [{ filename: `TradeLink-Receipt-${tradeReceiptNo}.pdf`, content: tradePdf }],
-                });
-                console.log(`[updatePaymentApproval] trade receipt email sent to ${tradeEmail}`);
-              } catch (tradeEmailErr) {
-                console.error('[updatePaymentApproval] trade receipt email failed:', tradeEmailErr.message);
-                stripeWarnings.push({ stage: 'trade_receipt_email', message: tradeEmailErr.message });
-              }
-            }
-
+          // Unchanged meaning: tracks that the contractor's receipt went out.
+          if (issued.contractor?.ok) {
             await WorkHoursOrder.findByIdAndUpdate(newOrder._id, { receiptSent: true });
           }
         }
