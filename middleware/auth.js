@@ -2,6 +2,17 @@ import jwt from 'jsonwebtoken';
 import TradePro from '../models/TradePro.js';
 import Contractor from '../models/Contractor.js';
 
+// Fail fast on a missing signing secret — the entire auth model rests on it, and
+// a blank secret would let anyone mint valid tokens (finding #4). A too-short
+// secret is a loud warning rather than a hard stop so a deploy isn't bricked by
+// an existing short value.
+if (!process.env.JWT_SECRET) {
+  throw new Error('JWT_SECRET is not set — refusing to start without a signing secret.');
+}
+if (process.env.JWT_SECRET.length < 32) {
+  console.warn('[security] JWT_SECRET is shorter than 32 characters — use a long, random secret in production.');
+}
+
 export async function protect(req, res, next) {
   try {
     let token = req.cookies?.token;

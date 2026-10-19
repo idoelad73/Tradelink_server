@@ -33,9 +33,20 @@ const contractorSchema = new Schema(
     stripeCustomerId:            { type: String, default: null },
     stripeDefaultPaymentMethod:  { type: String, default: null },
 
+    // ── Terms of Use acceptance (captured at registration) ──
+    termsAcceptedAt: { type: Date,   default: null },
+    termsVersion:    { type: String, default: null },
+
     // ── Password reset ────────────────────────────────────
     passwordResetTokenHash: { type: String, default: null, select: false },
     passwordResetExpiresAt: { type: Date,   default: null },
+
+    // ── Refresh token ────────────────────────────────────────
+    // Only the SHA-256 hash of the current refresh token is stored (never the
+    // raw value). Nulling it revokes the session (logout). One hash = one active
+    // session per account; a new login/refresh rotates it and invalidates the old.
+    refreshTokenHash:      { type: String, default: null, select: false },
+    refreshTokenExpiresAt: { type: Date,   default: null },
   },
   { timestamps: true }
 );

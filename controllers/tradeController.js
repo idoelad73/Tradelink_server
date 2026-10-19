@@ -620,10 +620,13 @@ export async function findJobs(req, res, next) {
       return res.status(422).json({ message: 'no_location' });
     }
 
-    const { distance = '25', unit = 'mi' } = req.query;
+    const { distance = '25', unit = 'mi', minGrade: rawMinGrade } = req.query;
     const meters = unit === 'km'
       ? parseFloat(distance) * 1000
       : parseFloat(distance) * 1609.344;
+    const minGrade = rawMinGrade ? parseInt(rawMinGrade, 10) : 0;
+    // Optional project type filter — anything else means "any type"
+    const siteType = ['residential', 'commercial'].includes(req.query.siteType) ? req.query.siteType : null;
 
     const professionality = pro.professionality;
 
@@ -676,6 +679,7 @@ export async function findJobs(req, res, next) {
           maxDistance:   meters,
           query: {
             status: 'active',
+            ...(siteType && { type: siteType }),
             tradesNeeded: {
               $elemMatch: {
                 name:     { $regex: new RegExp(`^${professionality}$`, 'i') },
@@ -716,6 +720,14 @@ export async function findJobs(req, res, next) {
         (t) => t.name.toLowerCase() === professionality.toLowerCase()
       );
       if (tradeEntry?.requiredDate && bookedDates.has(tradeEntry.requiredDate)) return false;
+
+      // Optional minimum contractor grade — mirrors the contractor-side trade
+      // rating filter: graded contractors must meet the bar, while ungraded ones
+      // (avgGrade null/absent) are always kept so new contractors aren't buried.
+      if (minGrade > 0) {
+        const avg = site.contractorInfo?.avgGrade;
+        if (avg != null && avg < minGrade) return false;
+      }
       return true;
     });
 

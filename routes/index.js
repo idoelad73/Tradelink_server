@@ -6,6 +6,7 @@ import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import Receipt       from '../models/Receipt.js';
 import { protect, adminOnly } from '../middleware/auth.js';
 import { geocodeAddress } from '../utils/geocode.js';
+import { getAllTradeRates } from '../utils/tradeRates.js';
 
 import authRoutes       from './auth.js';
 import contractorRoutes from './contractor.js';
@@ -43,6 +44,15 @@ router.get('/trade-types', async (_req, res, next) => {
   try {
     const types = await TradePro.distinct('professionality');
     res.json({ types: types.filter(Boolean).sort() });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Public — typical market hourly rate per trade (trade_rates, JSON fallback)
+router.get('/trade-rates', async (_req, res, next) => {
+  try {
+    res.json({ rates: await getAllTradeRates() });
   } catch (err) {
     next(err);
   }

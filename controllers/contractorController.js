@@ -13,7 +13,7 @@ function normalizeTrades(raw) {
       ? {
           name: t, assigned: false,
           budgetType: null, maxAmount: null, totalHours: null, totalWorkingHrs: null,
-          requiredDate: null, workers_no: null,
+          requiredDate: null, workers_no: null, rateComment: '',
         }
       : {
           name:            t.name,
@@ -25,6 +25,9 @@ function normalizeTrades(raw) {
           totalWorkingHrs: t.totalWorkingHrs ?? null,   // ← was silently dropped before
           requiredDate:    t.requiredDate    ?? null,
           workers_no:      t.workers_no      ?? t.workersNeeded ?? null,
+          // This whitelist is exhaustive — anything missing here is dropped on
+          // save, so new tradesNeeded fields must be added in both places.
+          rateComment:     t.rateComment     ?? '',
         }
   );
 }
@@ -524,10 +527,13 @@ export async function getApplications(req, res, next) {
       return bookedKeys.has(key) ? { ...app, _alreadyBooked: true } : app;
     });
 
-    // Reschedule requests sent by trade pros
+    // Reschedule requests sent by trade pros. Approved ones are included so the
+    // contractor keeps a record of what they already actioned — same as the
+    // trade's own messages modal. The client renders those read-only, and the
+    // navbar badge counts only the pending ones.
     const rescheduleRequests = await Message.find({
       contractor: req.userId,
-      status:     'pending',
+      status:     { $in: ['pending', 'approved'] },
       type:       'reschedule',
     })
       .populate('tradePro', 'fullName professionality photo hourlyRate')
@@ -537,11 +543,12 @@ export async function getApplications(req, res, next) {
 
     const reschedules = rescheduleRequests.map(m => ({ ...m, _isReschedule: true }));
 
-    // Pending worker_offer messages from trade pros awaiting contractor approval
+    // worker_offer messages from trade pros. Approved ones are returned too so
+    // the contractor can see what they confirmed, not just what's outstanding.
     const workerOffers = await Message.find({
       contractor: req.userId,
       type:       'worker_offer',
-      status:     'pending',
+      status:     { $in: ['pending', 'approved'] },
     })
       .populate('tradePro', 'fullName professionality photo hourlyRate')
       .populate('site',     'name address type photo tradesNeeded')
@@ -1446,6 +1453,64 @@ export async function getMyReceipts(req, res, next) {
 
     const receipts = await Receipt.find(filter).sort({ createdAt: -1 }).lean();
     res.json({ receipts });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// GET /api/contractor/sites/:siteId/messages
+// Every message tied to one project, for the "Messages Status" modal on the
+// project card. Ownership is enforced against the Site, not just the message's
+// contractor field, so another contractor's siteId can't be probed.
+export async function getSiteMessages(req, res, next) {
+  try {
+    const { siteId } = req.params;
+
+    const site = await Site.findOne({ _id: siteId, contractor: req.userId })
+      .select('name address')
+      .lean();
+    if (!site) return res.status(404).json({ message: 'Project not found' });
+
+    const messages = await Message.find({ site: siteId })
+      .populate('tradePro', 'fullName professionality photo hourlyRate')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // 'payment' messages carry a JSON snapshot in `text` rather than prose —
+    // decode it here so the client doesn't need to know that storage detail.
+    const shaped = messages.map((m) => {
+      let snapshot = null;
+      if (m.type === 'payment' && m.text) {
+        try { snapshot = JSON.parse(m.text); } catch { /* not JSON — leave null */ }
+      }
+      return {
+        _id:            m._id,
+        type:           m.type,
+        status:         m.status,
+        senderType:     m.senderType,
+        requestedDate:  m.requestedDate || null,
+        tradeName:      m.tradeName || m.tradePro?.professionality || null,
+        workersOffered: m.workersOffered ?? null,
+        totalHours:     m.totalHours ?? null,
+        min_deposit:    m.min_deposit ?? null,
+        depositStatus:  m.depositStatus ?? null,
+        createdAt:      m.createdAt,
+        updatedAt:      m.updatedAt,
+        tradePro:       m.tradePro
+          ? {
+              _id:             m.tradePro._id,
+              fullName:        m.tradePro.fullName,
+              professionality: m.tradePro.professionality,
+              photo:           m.tradePro.photo ?? null,
+              hourlyRate:      m.tradePro.hourlyRate ?? null,
+            }
+          : null,
+        snapshot,
+        text: m.type === 'payment' ? null : (m.text || null),
+      };
+    });
+
+    res.json({ site, messages: shaped });
   } catch (err) {
     next(err);
   }

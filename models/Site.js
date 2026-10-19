@@ -27,6 +27,9 @@ const siteSchema = new Schema(
       totalWorkingHrs: { type: Number, default: null },
       requiredDate:    { type: String, default: null }, // YYYY-MM-DD
       workers_no:      { type: Number, default: null }, // number of workers needed
+      // Contractor's free-text explanation of how this trade's rate/budget was
+      // set. Written alongside the budget and shown read-only to trade pros.
+      rateComment:     { type: String, default: '', trim: true, maxlength: 1000 },
     }],
 
     photo:  { type: String, default: null }, // Cloudinary URL

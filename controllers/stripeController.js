@@ -3,121 +3,16 @@ import WorkHoursOrder from '../models/WorkHoursOrder.js';
 import Contractor     from '../models/Contractor.js';
 import TradePro       from '../models/TradePro.js';
 import Message        from '../models/Message.js';
-import { isConnectReady } from '../utils/connectStatus.js';
 import { issueOrderReceipts } from '../utils/receipts.js';
 
 // Platform fee % read from .env — e.g. STRIPE_PLATFORM_FEE_PERCENT=5  means 5%
 const PLATFORM_FEE_PERCENT = parseFloat(process.env.STRIPE_PLATFORM_FEE_PERCENT ?? '0');
 
-// ── POST /api/stripe/create-payment-intent ────────────────────────────────────
-// Authenticated contractor only (auth middleware applied in route).
-// Verifies the order is approved, gets/creates a Stripe Customer for the
-// contractor, then creates a PaymentIntent server-side.
-// Returns { clientSecret, amount, tradeName } — clientSecret is consumed by
-// the React PaymentElement; it NEVER passes through our DOM.
-export async function createPaymentIntent(req, res, next) {
-  try {
-    const { orderId } = req.body;
-
-    if (!orderId) {
-      return res.status(400).json({ message: 'orderId is required' });
-    }
-
-    // Verify: order must belong to this contractor AND be approved
-    const order = await WorkHoursOrder.findOne({
-      _id:           orderId,
-      contractor_id: req.userId,
-      status:        'approved',
-    })
-      .populate('trade_id', 'fullName professionality stripeAccountId stripeOnboarded')
-      .lean();
-
-    if (!order) {
-      return res.status(404).json({ message: 'Approved order not found' });
-    }
-
-    if (order.paymentStatus === 'paid') {
-      return res.status(409).json({ message: 'This order has already been paid' });
-    }
-
-    // ── Get or create Stripe Customer for this contractor ────────────────────
-    const contractor = await Contractor.findById(req.userId).select('email companyName stripeCustomerId').lean();
-
-    let customerId = contractor.stripeCustomerId;
-
-    if (!customerId) {
-      const customer = await stripe.customers.create({
-        email: contractor.email,
-        name:  contractor.companyName,
-        metadata: { contractorId: String(contractor._id) },
-      });
-      customerId = customer.id;
-      // Persist: only the Stripe ID — no card data ever stored
-      await Contractor.findByIdAndUpdate(req.userId, { stripeCustomerId: customerId });
-    }
-
-    const amountCents = Math.round(order.order_sum * 100); // Stripe works in cents
-
-    // ── Platform fee calculation ─────────────────────────────────────────────
-    const tradePro     = order.trade_id;
-    const feePercent   = PLATFORM_FEE_PERCENT;                                      // e.g. 5
-    const feeCents     = feePercent > 0 ? Math.round(amountCents * feePercent / 100) : 0;
-    const payoutCents  = amountCents - feeCents;                                     // TradePro's share
-    const feeDollars   = parseFloat((feeCents   / 100).toFixed(2));
-    const payoutDollars= parseFloat((payoutCents / 100).toFixed(2));
-
-    console.log(`[Stripe] Order $${order.order_sum} | Fee ${feePercent}% = $${feeDollars} | TradePro payout = $${payoutDollars}`);
-
-    // ── Create PaymentIntent server-side (rule #7) ───────────────────────────
-    // application_fee_amount → automatically sent to TradeLink's Stripe platform account
-    // transfer_data.destination → sends the remainder to TradePro's connected account
-    const hasConnectAcct = await isConnectReady(tradePro);
-
-    const piParams = {
-      amount:   amountCents,
-      currency: 'usd',
-      customer: customerId,
-      automatic_payment_methods: { enabled: true },
-      metadata: {
-        orderId:       String(order._id),
-        contractorId:  String(order.contractor_id),
-        tradeId:       String(tradePro._id),
-        date:          order.date,
-        feePercent:    String(feePercent),
-        feeCents:      String(feeCents),
-        payoutCents:   String(payoutCents),
-      },
-      description: `TradeLink — ${tradePro.fullName} (${tradePro.professionality}) ${order.date}`,
-    };
-
-    // Only split to TradePro's Stripe account if they have completed Connect onboarding
-    if (hasConnectAcct && feeCents > 0) {
-      piParams.application_fee_amount = feeCents;
-      piParams.transfer_data          = { destination: tradePro.stripeAccountId };
-    } else if (!hasConnectAcct) {
-      console.warn(`[Stripe] TradePro ${tradePro?._id} not connected — full $${order.order_sum} stays in platform account, fee tracked in DB only`);
-    }
-
-    const paymentIntent = await stripe.paymentIntents.create(
-      piParams,
-      { idempotencyKey: `pi-${req.userId}-${orderId}` }
-    );
-
-    // Mark order as payment-pending (PI created, awaiting card confirmation)
-    await WorkHoursOrder.findByIdAndUpdate(orderId, {
-      stripePaymentIntentId: paymentIntent.id,
-      paymentStatus:         'pending',
-    });
-
-    res.json({
-      clientSecret: paymentIntent.client_secret,
-      amount:       order.order_sum,
-      tradeName:    order.trade_id.fullName,
-    });
-  } catch (err) {
-    next(err);
-  }
-}
+// NOTE: the former `createPaymentIntent` (full-amount charge-split) endpoint was
+// removed. The live settlement flow is deposit-hold → approval → transfer the
+// deposit + charge the overage difference (contractorController.updatePaymentApproval);
+// nothing in the client ever called the full-charge endpoint, and leaving it live
+// was a dormant second settlement path (QA finding #10).
 
 // ── POST /api/stripe/create-deposit-intent ───────────────────────────────────
 // Creates a PaymentIntent with capture_method:'manual' — authorizes (holds) the
@@ -128,8 +23,14 @@ export async function createDepositIntent(req, res, next) {
     const isDirect = !!messageId && !siteId;
     console.log(`\n[createDepositIntent] siteId=${siteId||'(none)'} messageId=${messageId||'(none)'} amount=${amount} contractorId=${req.userId}`);
 
-    if ((!siteId && !messageId) || !amount || amount <= 0) {
-      return res.status(400).json({ message: 'siteId or messageId, and amount are required' });
+    // Coerce + bound the amount. It was taken as-is from the body, so a string,
+    // NaN, zero, negative, or absurd value flowed straight into the hold and the
+    // later payout/overage math (finding #8). The upper bound is a sanity cap,
+    // not a business rule — see the note about deriving it from the booking.
+    const amt = Number(amount);
+    const MAX_DEPOSIT = 1_000_000;
+    if ((!siteId && !messageId) || !Number.isFinite(amt) || amt <= 0 || amt > MAX_DEPOSIT) {
+      return res.status(400).json({ message: 'siteId or messageId, and a valid amount are required' });
     }
 
     const contractor = await Contractor.findById(req.userId)
@@ -146,7 +47,7 @@ export async function createDepositIntent(req, res, next) {
       await Contractor.findByIdAndUpdate(req.userId, { stripeCustomerId: customerId });
     }
 
-    const amountCents = Math.round(amount * 100);
+    const amountCents = Math.round(amt * 100);
     const msgFilter   = isDirect
       ? { _id: messageId, contractor: req.userId }
       : { site: siteId,  contractor: req.userId };
@@ -164,7 +65,7 @@ export async function createDepositIntent(req, res, next) {
         const reusable = ['requires_payment_method', 'requires_confirmation', 'requires_action'];
         if (reusable.includes(existing.status) && existing.payment_method_types?.includes('card')) {
           console.log(`[createDepositIntent] reusing valid PI`);
-          return res.json({ clientSecret: existing.client_secret, amount });
+          return res.json({ clientSecret: existing.client_secret, amount: amt });
         }
         if (!['succeeded', 'canceled'].includes(existing.status)) {
           await stripe.paymentIntents.cancel(existing.id);
@@ -207,7 +108,7 @@ export async function createDepositIntent(req, res, next) {
     );
     console.log(`[createDepositIntent] stamped ${stampResult.modifiedCount}/${stampResult.matchedCount} messages`);
 
-    res.json({ clientSecret: paymentIntent.client_secret, amount });
+    res.json({ clientSecret: paymentIntent.client_secret, amount: amt });
   } catch (err) {
     next(err);
   }
@@ -250,7 +151,7 @@ export async function handleWebhook(req, res) {
         console.log(`\n✅ [Stripe] charge.succeeded`);
         console.log(`   Charge  : ${pi.id ?? ''}`);
         console.log(`   Amount  : $${((pi.amount ?? 0) / 100).toFixed(2)}`);
-        console.log(`   Email   : ${pi.billing_details?.email ?? pi.receipt_email ?? '—'}`);
+        // Cardholder email intentionally not logged (PII — finding #6).
         break;
 
       case 'payment_intent.succeeded': {
@@ -374,8 +275,23 @@ export async function handleWebhook(req, res) {
         break;
     }
   } catch (err) {
-    console.error('[Stripe webhook] DB update failed:', err.message);
-    // Still return 200 so Stripe doesn't retry — we log the error
+    // Return 500 so Stripe RETRIES this event (with backoff, for ~3 days).
+    // Previously this was swallowed with a 200: a transient DB failure during
+    // payment_intent.succeeded left the order not marked paid, no receipt issued,
+    // and NO retry and NO alert — money state silently drifted (finding #9).
+    //
+    // Safe to retry because every branch above is idempotent: payment_intent.
+    // succeeded short-circuits on `receiptSent` and issues receipts through an
+    // order-level guard; payment_failed / amount_capturable_updated / account.
+    // updated are all no-op on replay. A signature failure is handled earlier
+    // and still returns 400 (not retryable).
+    console.error(`\n[Stripe webhook] ❌ processing failed — Stripe will retry`);
+    console.error(`   event   : ${event.type}`);
+    console.error(`   pi/obj  : ${piId}`);
+    console.error(`   order   : ${orderId ?? '—'}`);
+    console.error(`   message : ${err.message}`);
+    console.error(`   stack   : ${err.stack}\n`);
+    return res.status(500).json({ received: false, error: 'processing_failed' });
   }
 
   res.json({ received: true });

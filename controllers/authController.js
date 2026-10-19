@@ -8,36 +8,84 @@ import { uploadPhoto, uploadDocument } from '../utils/cloudinary.js';
 import stripe from '../utils/stripe.js';
 import { sendMail } from '../utils/mailer.js';
 import { geocodeAddress } from '../utils/geocode.js';
+import { validatePassword } from '../utils/passwordPolicy.js';
 
 // Force BSON Double so MongoDB stores as Float64, not Int32
 const toDouble = (v) => new mongoose.mongo.Double(parseFloat(v));
 
+// Short-lived ACCESS token (Bearer). Default 2h so a stolen/leaked token has a
+// small window (finding #3); the client silently renews it via /auth/refresh.
+const ACCESS_TTL        = process.env.JWT_EXPIRES_IN   || '2h';
+const REFRESH_TTL_DAYS  = parseInt(process.env.REFRESH_TOKEN_DAYS || '14', 10);
+const REFRESH_COOKIE    = 'refreshToken';
+
 const signToken = (id, type) =>
-  jwt.sign({ id, type }, process.env.JWT_SECRET, {
-    expiresIn: process.env.JWT_EXPIRES_IN || '7d',
-  });
+  jwt.sign({ id, type }, process.env.JWT_SECRET, { expiresIn: ACCESS_TTL });
 
-const sendToken = (user, type, statusCode, res, extra = {}) => {
-  const token = signToken(user._id, type);
-
-  res.cookie('token', token, {
+// The long-lived refresh token lives ONLY in an httpOnly cookie, so page JS
+// (and therefore XSS) can never read it — unlike the access token, which must be
+// readable to be sent as a Bearer header (finding #5). Scoped to /api/auth so it
+// is sent only to the refresh/logout endpoints, not every API call.
+function refreshCookieOptions() {
+  const isProd = process.env.NODE_ENV === 'production';
+  return {
     httpOnly: true,
-    secure: process.env.NODE_ENV === 'production',
-    sameSite: 'lax',
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    secure:   isProd,                 // required with sameSite:'none'
+    sameSite: isProd ? 'none' : 'lax', // client and API are different sites in prod
+    path:     '/api/auth',
+    maxAge:   REFRESH_TTL_DAYS * 24 * 60 * 60 * 1000,
+  };
+}
+
+// Mint a refresh token: persist only its hash + expiry on the user, return the
+// raw value for the cookie. Rotating (calling this again) invalidates the prior
+// one, since the stored hash no longer matches it.
+async function issueRefreshToken(user, Model) {
+  const raw  = crypto.randomBytes(48).toString('hex');
+  const hash = crypto.createHash('sha256').update(raw).digest('hex');
+  await Model.findByIdAndUpdate(user._id, {
+    refreshTokenHash:      hash,
+    refreshTokenExpiresAt: new Date(Date.now() + REFRESH_TTL_DAYS * 24 * 60 * 60 * 1000),
   });
+  return raw;
+}
+
+const userPayload = (user, type) => ({
+  id:   user._id,
+  type,
+  email: user.email,
+  ...(user.fullName    && { fullName: user.fullName }),
+  ...(user.companyName && { companyName: user.companyName }),
+  ...(user.user_type   && { user_type: user.user_type }),
+  photo: user.photo || null,
+});
+
+// An email identifies at most ONE account across BOTH roles. Checking only the
+// current collection let the same address own a trade AND a contractor account,
+// which then broke password reset: forgot-password resolves an email to a single
+// collection (trade first), so the other account could never be recovered.
+// (QA finding A2.) Normalised to match the schema's lowercase+trim setters.
+async function emailInUse(email) {
+  const norm = String(email || '').toLowerCase().trim();
+  if (!norm) return false;
+  const [trade, contractor] = await Promise.all([
+    TradePro.exists({ email: norm }),
+    Contractor.exists({ email: norm }),
+  ]);
+  return Boolean(trade || contractor);
+}
+
+const sendToken = async (user, type, statusCode, res, extra = {}) => {
+  const Model       = type === 'trade' ? TradePro : Contractor;
+  const accessToken = signToken(user._id, type);
+  const refreshRaw  = await issueRefreshToken(user, Model);
+
+  // Refresh token → httpOnly cookie only. Access token → body (Bearer).
+  res.cookie(REFRESH_COOKIE, refreshRaw, refreshCookieOptions());
 
   res.status(statusCode).json({
-    token,
-    user: {
-      id:   user._id,
-      type,
-      email: user.email,
-      ...(user.fullName    && { fullName: user.fullName }),
-      ...(user.companyName && { companyName: user.companyName }),
-      ...(user.user_type   && { user_type: user.user_type }),
-      photo: user.photo || null,
-    },
+    token: accessToken,
+    user:  userPayload(user, type),
     ...extra,
   });
 };
@@ -61,11 +109,13 @@ export async function registerTrade(req, res, next) {
       fullName, email, password, phone, address,
       city, state, zip,
       professionality, locationConsent, latitude, longitude,
-      hourlyRate,
+      hourlyRate, termsVersion,
     } = req.body;
 
-    const existing = await TradePro.findOne({ email });
-    if (existing) {
+    const pw = validatePassword(password);
+    if (!pw.ok) return res.status(400).json({ message: pw.message });
+
+    if (await emailInUse(email)) {
       return res.status(409).json({ message: 'Email already registered' });
     }
 
@@ -134,7 +184,7 @@ export async function registerTrade(req, res, next) {
 
     console.log(`\n[Register] Trade: ${email}`);
     console.log(`[Register] bankToken  : ${bankToken  ? bankToken.substring(0, 12) + '...' : 'NONE'}`);
-    console.log(`[Register] dob        : ${dob        || 'NONE'}`);
+    console.log(`[Register] dob        : ${dob        ? 'provided' : 'NONE'}`);
     console.log(`[Register] ssnLast4   : ${ssnLast4   ? '****' : 'NONE'}`);
     console.log(`[Register] holderType : ${holderType || 'NONE'}`);
 
@@ -259,6 +309,10 @@ export async function registerTrade(req, res, next) {
       },
       stripeAccountId,
       stripeOnboarded,
+      // Stamped server-side: the client sends which version it displayed, but
+      // the timestamp must not be client-supplied.
+      termsVersion:    termsVersion || null,
+      termsAcceptedAt: termsVersion ? new Date() : null,
     });
 
     // Post-create: force coordinate BSON type to Double using raw collection API.
@@ -275,7 +329,7 @@ export async function registerTrade(req, res, next) {
       );
     }
 
-    sendToken(user, 'trade', 201, res);
+    await sendToken(user, 'trade', 201, res);
   } catch (err) {
     next(err);
   }
@@ -284,7 +338,10 @@ export async function registerTrade(req, res, next) {
 // ── POST /api/auth/login/trade ────────────────────────────────────────────────
 export async function loginTrade(req, res, next) {
   try {
-    const { email, password } = req.body;
+    // Coerce to strings so a JSON body like {"email":{"$ne":null}} can't inject a
+    // Mongo query operator into the lookup (finding #7).
+    const email    = String(req.body.email ?? '');
+    const password = String(req.body.password ?? '');
     if (!email || !password)
       return res.status(400).json({ message: 'Email and password are required' });
 
@@ -298,7 +355,7 @@ export async function loginTrade(req, res, next) {
       $inc: { loginCount: 1 },
     });
 
-    sendToken(user, 'trade', 200, res);
+    await sendToken(user, 'trade', 200, res);
   } catch (err) {
     next(err);
   }
@@ -307,7 +364,8 @@ export async function loginTrade(req, res, next) {
 // ── POST /api/auth/login/contractor ───────────────────────────────────────────
 export async function loginContractor(req, res, next) {
   try {
-    const { email, password } = req.body;
+    const email    = String(req.body.email ?? '');
+    const password = String(req.body.password ?? '');
     if (!email || !password)
       return res.status(400).json({ message: 'Email and password are required' });
 
@@ -321,7 +379,7 @@ export async function loginContractor(req, res, next) {
       $inc: { loginCount: 1 },
     });
 
-    sendToken(user, 'contractor', 200, res);
+    await sendToken(user, 'contractor', 200, res);
   } catch (err) {
     next(err);
   }
@@ -332,16 +390,20 @@ export async function loginContractor(req, res, next) {
 // whose user_type === 'admin' are allowed through.
 export async function loginAdmin(req, res, next) {
   try {
-    const { email, password } = req.body;
+    const email    = String(req.body.email ?? '');
+    const password = String(req.body.password ?? '');
     if (!email || !password)
       return res.status(400).json({ message: 'Email and password are required' });
 
+    // A4: do NOT distinguish "wrong credentials" from "valid but not an admin".
+    // The old 403-vs-401 split let an attacker confirm a working contractor
+    // login by trying it here. All failure modes now return the same 401, so a
+    // correct non-admin credential leaks nothing it didn't already at the normal
+    // contractor login.
     const user = await Contractor.findOne({ email }).select('+password');
-    if (!user || !(await user.comparePassword(password)))
+    const authed = user && (await user.comparePassword(password)) && user.user_type === 'admin';
+    if (!authed)
       return res.status(401).json({ message: 'Invalid email or password' });
-
-    if (user.user_type !== 'admin')
-      return res.status(403).json({ message: 'Access denied — admin account required' });
 
     await Contractor.findByIdAndUpdate(user._id, {
       isLoggedIn: true,
@@ -349,7 +411,7 @@ export async function loginAdmin(req, res, next) {
       $inc: { loginCount: 1 },
     });
 
-    sendToken(user, 'contractor', 200, res);
+    await sendToken(user, 'contractor', 200, res);
   } catch (err) {
     next(err);
   }
@@ -358,25 +420,39 @@ export async function loginAdmin(req, res, next) {
 // ── POST /api/auth/register/contractor ────────────────────────────────────────
 export async function registerContractor(req, res, next) {
   try {
-    const { companyName, email, password, phone, address, expertise } = req.body;
+    const { companyName, email, password, phone, address, expertise, termsVersion } = req.body;
 
-    const existing = await Contractor.findOne({ email });
-    if (existing) {
+    const pw = validatePassword(password);
+    if (!pw.ok) return res.status(400).json({ message: pw.message });
+
+    if (await emailInUse(email)) {
       return res.status(409).json({ message: 'Email already registered' });
     }
 
-    const expertiseArr = Array.isArray(expertise)
-      ? expertise
-      : typeof expertise === 'string'
-        ? JSON.parse(expertise)
-        : [];
+    // `expertise` may arrive as an array (JSON body) or a JSON string (multipart).
+    // A non-JSON string must be a clean 400, not an uncaught SyntaxError → 500.
+    let expertiseArr = [];
+    if (Array.isArray(expertise)) {
+      expertiseArr = expertise;
+    } else if (typeof expertise === 'string' && expertise.trim()) {
+      try {
+        const parsed = JSON.parse(expertise);
+        expertiseArr = Array.isArray(parsed) ? parsed : [];
+      } catch {
+        return res.status(400).json({ message: 'expertise must be a JSON array' });
+      }
+    }
 
     const user = await Contractor.create({
       companyName, email, password, phone, address,
       expertise: expertiseArr,
+      // Stamped server-side: the client sends which version it displayed, but
+      // the timestamp must not be client-supplied.
+      termsVersion:    termsVersion || null,
+      termsAcceptedAt: termsVersion ? new Date() : null,
     });
 
-    sendToken(user, 'contractor', 201, res);
+    await sendToken(user, 'contractor', 201, res);
   } catch (err) {
     next(err);
   }
@@ -466,9 +542,8 @@ export async function resetPassword(req, res, next) {
     if (!token || !password) {
       return res.status(400).json({ message: 'Token and new password are required.' });
     }
-    if (password.length < 8) {
-      return res.status(400).json({ message: 'Password must be at least 8 characters.' });
-    }
+    const pw = validatePassword(password);
+    if (!pw.ok) return res.status(400).json({ message: pw.message });
 
     const tokenHash = crypto.createHash('sha256').update(String(token)).digest('hex');
     const now       = new Date();
@@ -490,9 +565,69 @@ export async function resetPassword(req, res, next) {
       password:               hashedPassword,
       passwordResetTokenHash: null,
       passwordResetExpiresAt: null,
+      // Changing the password revokes any existing session (refresh token), so a
+      // compromised-then-reset account can't keep a live session open.
+      refreshTokenHash:       null,
+      refreshTokenExpiresAt:  null,
     });
 
     return res.status(200).json({ message: 'Password reset successfully. You can now log in.' });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/auth/refresh ────────────────────────────────────────────────────
+// Exchanges the httpOnly refresh cookie for a fresh short-lived access token.
+// Rotates the refresh token on every call (the old one stops matching), so a
+// stolen-then-used refresh token is invalidated by the legitimate user's next
+// refresh. No access token / Bearer header is required or trusted here.
+export async function refreshToken(req, res, next) {
+  try {
+    const raw = req.cookies?.[REFRESH_COOKIE];
+    if (!raw) return res.status(401).json({ message: 'No active session' });
+
+    const hash = crypto.createHash('sha256').update(String(raw)).digest('hex');
+    const now  = new Date();
+
+    let user  = await TradePro.findOne({ refreshTokenHash: hash, refreshTokenExpiresAt: { $gt: now } });
+    let type  = 'trade';
+    let Model = TradePro;
+    if (!user) {
+      user  = await Contractor.findOne({ refreshTokenHash: hash, refreshTokenExpiresAt: { $gt: now } });
+      type  = 'contractor';
+      Model = Contractor;
+    }
+
+    if (!user) {
+      res.clearCookie(REFRESH_COOKIE, refreshCookieOptions());
+      return res.status(401).json({ message: 'Session expired — please log in again.' });
+    }
+
+    const newRaw = await issueRefreshToken(user, Model); // rotate
+    res.cookie(REFRESH_COOKIE, newRaw, refreshCookieOptions());
+
+    return res.status(200).json({ token: signToken(user._id, type), user: userPayload(user, type) });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// ── POST /api/auth/logout ─────────────────────────────────────────────────────
+// Revokes the session server-side (nulls the stored hash) and clears the cookie.
+// Idempotent and safe to call without a valid session.
+export async function logout(req, res, next) {
+  try {
+    const raw = req.cookies?.[REFRESH_COOKIE];
+    if (raw) {
+      const hash = crypto.createHash('sha256').update(String(raw)).digest('hex');
+      await Promise.all([
+        TradePro.updateOne({ refreshTokenHash: hash },   { refreshTokenHash: null, refreshTokenExpiresAt: null }),
+        Contractor.updateOne({ refreshTokenHash: hash }, { refreshTokenHash: null, refreshTokenExpiresAt: null }),
+      ]);
+    }
+    res.clearCookie(REFRESH_COOKIE, refreshCookieOptions());
+    return res.status(200).json({ message: 'Logged out' });
   } catch (err) {
     next(err);
   }

@@ -1,0 +1,226 @@
+{
+  "source": "US Bureau of Labor Statistics, OEWS national hourly wages",
+  "billMultiplier": 1.9,
+  "rates": [
+    {
+      "trade": "Electrician",
+      "soc": "47-2111",
+      "wageP25": 23.76,
+      "wageMedian": 30.38,
+      "wageP75": 40.36,
+      "rateLow": 45,
+      "rateHigh": 75,
+      "year": 2025
+    },
+    {
+      "trade": "Plumber",
+      "soc": "47-2152",
+      "wageP25": 24.13,
+      "wageMedian": 30.67,
+      "wageP75": 40.92,
+      "rateLow": 45,
+      "rateHigh": 80,
+      "year": 2025
+    },
+    {
+      "trade": "HVAC Technician",
+      "soc": "49-9021",
+      "wageP25": 23.25,
+      "wageMedian": 29.33,
+      "wageP75": 37.05,
+      "rateLow": 45,
+      "rateHigh": 70,
+      "year": 2025
+    },
+    {
+      "trade": "Carpenter",
+      "soc": "47-2031",
+      "wageP25": 23.32,
+      "wageMedian": 29.12,
+      "wageP75": 36.94,
+      "rateLow": 45,
+      "rateHigh": 70,
+      "year": 2025
+    },
+    {
+      "trade": "Painter",
+      "soc": "47-2141",
+      "wageP25": 21.46,
+      "wageMedian": 23.75,
+      "wageP75": 29.65,
+      "rateLow": 40,
+      "rateHigh": 55,
+      "year": 2025
+    },
+    {
+      "trade": "Roofer",
+      "soc": "47-2181",
+      "wageP25": 22.24,
+      "wageMedian": 26.65,
+      "wageP75": 31.44,
+      "rateLow": 40,
+      "rateHigh": 60,
+      "year": 2025
+    },
+    {
+      "trade": "Mason / Bricklayer",
+      "soc": "47-2021",
+      "wageP25": 24.57,
+      "wageMedian": 29.87,
+      "wageP75": 38.15,
+      "rateLow": 45,
+      "rateHigh": 70,
+      "year": 2025
+    },
+    {
+      "trade": "Flooring Specialist",
+      "soc": "47-2042",
+      "wageP25": 21.95,
+      "wageMedian": 27.15,
+      "wageP75": 35.5,
+      "rateLow": 40,
+      "rateHigh": 65,
+      "year": 2025
+    },
+    {
+      "trade": "Tile Setter",
+      "soc": "47-2044",
+      "wageP25": 21.73,
+      "wageMedian": 26.77,
+      "wageP75": 33.76,
+      "rateLow": 40,
+      "rateHigh": 65,
+      "year": 2025
+    },
+    {
+      "trade": "Welder",
+      "soc": "51-4121",
+      "wageP25": 22.5,
+      "wageMedian": 25.84,
+      "wageP75": 30.29,
+      "rateLow": 45,
+      "rateHigh": 60,
+      "year": 2025
+    },
+    {
+      "trade": "Landscaper",
+      "soc": "37-3011",
+      "wageP25": 17.4,
+      "wageMedian": 18.82,
+      "wageP75": 22.52,
+      "rateLow": 35,
+      "rateHigh": 45,
+      "year": 2025
+    },
+    {
+      "trade": "Pest Control",
+      "soc": "37-2021",
+      "wageP25": 18,
+      "wageMedian": 21.75,
+      "wageP75": 23.85,
+      "rateLow": 35,
+      "rateHigh": 45,
+      "year": 2025
+    },
+    {
+      "trade": "Locksmith",
+      "soc": "49-9094",
+      "wageP25": 20.75,
+      "wageMedian": 24.68,
+      "wageP75": 31.04,
+      "rateLow": 40,
+      "rateHigh": 60,
+      "year": 2025
+    },
+    {
+      "trade": "Glazier / Window Installer",
+      "soc": "47-2121",
+      "wageP25": 22.27,
+      "wageMedian": 27.44,
+      "wageP75": 32.03,
+      "rateLow": 40,
+      "rateHigh": 60,
+      "year": 2025
+    },
+    {
+      "trade": "Drywall / Plasterer",
+      "soc": "47-2081",
+      "wageP25": 22.81,
+      "wageMedian": 28.33,
+      "wageP75": 35.69,
+      "rateLow": 45,
+      "rateHigh": 70,
+      "year": 2025
+    },
+    {
+      "trade": "Insulation Specialist",
+      "soc": "47-2131",
+      "wageP25": 20.77,
+      "wageMedian": 23.62,
+      "wageP75": 29.32,
+      "rateLow": 40,
+      "rateHigh": 55,
+      "year": 2025
+    },
+    {
+      "trade": "Concrete & Foundation",
+      "soc": "47-2051",
+      "wageP25": 22.6,
+      "wageMedian": 27.41,
+      "wageP75": 32.15,
+      "rateLow": 45,
+      "rateHigh": 60,
+      "year": 2025
+    },
+    {
+      "trade": "Pool & Spa Technician",
+      "soc": "49-9071",
+      "wageP25": 19.64,
+      "wageMedian": 23.84,
+      "wageP75": 30.1,
+      "rateLow": 35,
+      "rateHigh": 55,
+      "year": 2025
+    },
+    {
+      "trade": "Solar Panel Installer",
+      "soc": "47-2231",
+      "wageP25": 22.45,
+      "wageMedian": 25.55,
+      "wageP75": 30.23,
+      "rateLow": 45,
+      "rateHigh": 55,
+      "year": 2025
+    },
+    {
+      "trade": "Garage Door Specialist",
+      "soc": "49-9011",
+      "wageP25": 22.41,
+      "wageMedian": 26.79,
+      "wageP75": 31.56,
+      "rateLow": 45,
+      "rateHigh": 60,
+      "year": 2025
+    },
+    {
+      "trade": "Handyman",
+      "soc": "49-9071",
+      "wageP25": 19.64,
+      "wageMedian": 23.84,
+      "wageP75": 30.1,
+      "rateLow": 35,
+      "rateHigh": 55,
+      "year": 2025
+    },
+    {
+      "trade": "Demolition Contractor",
+      "soc": "47-2061",
+      "wageP25": 18.57,
+      "wageMedian": 22.66,
+      "wageP75": 28.72,
+      "rateLow": 35,
+      "rateHigh": 55,
+      "year": 2025
+    }
+  ]
+}
