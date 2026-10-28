@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import request from 'supertest';
 import app from '../../app.js';
 import Site from '../../models/Site.js';
+import Message, { RATE_EXPLANATION_TYPE } from '../../models/Message.js';
 import {
   createContractor, createTradePro, createSite,
   asContractor, asTrade,
@@ -129,5 +130,88 @@ describe('rateComment — trade read path', () => {
     const job = res.body.results.find((r) => r.name === 'Nearby Job');
     expect(job).toBeDefined();
     expect(job.tradeEntry.rateComment).toBe('Budget covers prep + 2 coats.');
+  });
+});
+
+describe('rateComment — total_hours_explanations messages', () => {
+  const explanations = (siteId) =>
+    Message.find({ site: siteId, type: RATE_EXPLANATION_TYPE }).lean();
+
+  it('mirrors the comment into messages when a site is created, and drops it when cleared', async () => {
+    const contractor = await createContractor();
+    const res = await request(app)
+      .post('/api/contractor/sites')
+      .set(asContractor(contractor))
+      .field('name',    'Mirror Tower')
+      .field('type',    'commercial')
+      .field('address', '1 Main St, New York, NY')
+      .field('tradesNeeded', JSON.stringify([trade({ rateComment: 'Two coats.' })]));
+    expect(res.status).toBe(201);
+
+    let msgs = await explanations(res.body.site._id);
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]).toMatchObject({ tradeName: 'Painter', text: 'Two coats.', senderType: 'contractor' });
+
+    await request(app)
+      .patch(`/api/contractor/sites/${res.body.site._id}`)
+      .set(asContractor(contractor))
+      .send({ tradesNeeded: [trade({ rateComment: '' })] });
+    msgs = await explanations(res.body.site._id);
+    expect(msgs).toHaveLength(0);
+  });
+
+  it('PUT /rate-comment edits it any time (even on an assigned slot) and DELETE removes it', async () => {
+    const contractor = await createContractor();
+    const site = await createSite(contractor, { tradesNeeded: [trade({ assigned: true })] });
+
+    const put = await request(app)
+      .put(`/api/contractor/sites/${site._id}/rate-comment`)
+      .set(asContractor(contractor))
+      .send({ tradeName: 'Painter', text: '  Includes scaffolding.  ' });
+    expect(put.status).toBe(200);
+    expect(put.body.site.tradesNeeded[0].rateComment).toBe('Includes scaffolding.');
+
+    await request(app)
+      .put(`/api/contractor/sites/${site._id}/rate-comment`)
+      .set(asContractor(contractor))
+      .send({ tradeName: 'Painter', text: 'Updated text.' });
+    let msgs = await explanations(site._id);
+    expect(msgs).toHaveLength(1);                 // upsert, not a second message
+    expect(msgs[0].text).toBe('Updated text.');
+
+    const del = await request(app)
+      .delete(`/api/contractor/sites/${site._id}/rate-comment?tradeName=Painter`)
+      .set(asContractor(contractor));
+    expect(del.status).toBe(200);
+    expect((await Site.findById(site._id).lean()).tradesNeeded[0].rateComment).toBe('');
+    expect(await explanations(site._id)).toHaveLength(0);
+  });
+
+  it("refuses another contractor's project", async () => {
+    const owner = await createContractor();
+    const other = await createContractor();
+    const site  = await createSite(owner, { tradesNeeded: [trade()] });
+
+    const res = await request(app)
+      .put(`/api/contractor/sites/${site._id}/rate-comment`)
+      .set(asContractor(other))
+      .send({ tradeName: 'Painter', text: 'Hijack' });
+    expect(res.status).toBe(404);
+    expect(await explanations(site._id)).toHaveLength(0);
+  });
+
+  it('keeps explanations out of the project messages list', async () => {
+    const contractor = await createContractor();
+    const site = await createSite(contractor, { tradesNeeded: [trade()] });
+    await request(app)
+      .put(`/api/contractor/sites/${site._id}/rate-comment`)
+      .set(asContractor(contractor))
+      .send({ tradeName: 'Painter', text: 'Note' });
+
+    const res = await request(app)
+      .get(`/api/contractor/sites/${site._id}/messages`)
+      .set(asContractor(contractor));
+    expect(res.status).toBe(200);
+    expect(JSON.stringify(res.body)).not.toContain(RATE_EXPLANATION_TYPE);
   });
 });

@@ -58,12 +58,22 @@ router.get('/trade-rates', async (_req, res, next) => {
   }
 });
 
-// Public — returns all trade professionals for the contractor showcase
-router.get('/tradepros', async (_req, res, next) => {
+// Optional ?limit=N on public lists (1–50); absent/invalid = no limit
+const publicLimit = (q) => {
+  const n = parseInt(q, 10);
+  return Number.isFinite(n) && n > 0 ? Math.min(n, 50) : 0;
+};
+
+// Public — returns trade professionals for the contractor showcase (?limit=N)
+// ?featured=1 → only complete profiles (photo set), most-reviewed / best-rated first,
+// so bare test accounts don't end up on the public registration pages.
+router.get('/tradepros', async (req, res, next) => {
   try {
-    const tradePros = await TradePro.find({})
-      .select('fullName professionality photo hourlyRate address')
-      .sort({ createdAt: -1 })
+    const featured = req.query.featured === '1';
+    const tradePros = await TradePro.find(featured ? { photo: { $nin: [null, ''] } } : {})
+      .select('fullName professionality photo hourlyRate address avgGrade gradeCount')
+      .sort(featured ? { gradeCount: -1, avgGrade: -1, createdAt: -1 } : { createdAt: -1 })
+      .limit(publicLimit(req.query.limit))
       .lean();
     res.json({ tradePros });
   } catch (err) {
@@ -71,12 +81,23 @@ router.get('/tradepros', async (_req, res, next) => {
   }
 });
 
-// Public — returns all projects for the trade professional showcase
-router.get('/sites', async (_req, res, next) => {
+// Public — returns projects for the trade professional showcase
+// (?limit=N, ?active=1 → active only, ?withPhoto=1 → only projects that have a photo)
+router.get('/sites', async (req, res, next) => {
   try {
-    const sites = await Site.find({})
-      .select('name address type photo tradesNeeded')
+    // Unauthenticated endpoint: project only the slot fields the showcase pages
+    // render (name, assigned, requiredDate, workers_no — the last two shown on
+    // the public Trade Area cards by the owner's decision). The rest of the
+    // tradesNeeded subdocument — the contractor's private rateComment, budget
+    // (maxAmount/totalHours) and the assigned tradeProId — must not reach an
+    // anonymous caller (pinned by tests/api/rateCommentHardening.test.js).
+    const filter = {};
+    if (req.query.active === '1')    filter.status = 'active';
+    if (req.query.withPhoto === '1') filter.photo  = { $nin: [null, ''] };
+    const sites = await Site.find(filter)
+      .select('name address type photo status createdAt tradesNeeded.name tradesNeeded.assigned tradesNeeded.requiredDate tradesNeeded.workers_no')
       .sort({ createdAt: -1 })
+      .limit(publicLimit(req.query.limit))
       .lean();
     res.json({ sites });
   } catch (err) {

@@ -755,6 +755,8 @@ export async function findJobs(req, res, next) {
         photo:          site.photo,
         distanceMeters: site.distanceMeters,
         tradeEntry:     trade ? { ...trade, depositHeld, depositAmount } : null,
+        // Every trade slot on the project — shown on the job details page
+        projectTrades:  (site.tradesNeeded ?? []).map((t) => ({ name: t.name, assigned: !!t.assigned })),
         contractorId:         site.contractorInfo?._id || null,
         contractorName:       site.contractorInfo?.companyName || null,
         contractorAvgGrade:   site.contractorInfo?.avgGrade  ?? null,

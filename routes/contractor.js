@@ -4,6 +4,7 @@ import { protect, restrictTo } from '../middleware/auth.js';
 import {
   getMe, updateMe,
   createSite, getSites, getSite, updateSite, deleteSite, findTrades,
+  updateRateComment, deleteRateComment,
   getTradeBusyDays, getTradeProProfile, askAvailability, getWorkersLeft,
   getApplications, approveApplication, approveAvailabilityRequest, approveWorkerOffer,
   getNotifications, markNotificationsRead,
@@ -80,5 +81,7 @@ router.delete('/sites/:id/work-plan',         deleteWorkPlanTrade);
 router.get('/sites/:id/find-trades',  findTrades);
 router.patch('/sites/:id',            upload.single('photo'), updateSite);
 router.delete('/sites/:id',           deleteSite);
+router.put('/sites/:id/rate-comment',    updateRateComment);
+router.delete('/sites/:id/rate-comment', deleteRateComment);
 
 export default router;

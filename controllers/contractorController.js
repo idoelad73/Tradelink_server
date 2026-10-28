@@ -1,13 +1,32 @@
 import Contractor from '../models/Contractor.js';
-import Site from '../models/Site.js';
+import Site, { findDuplicateTradeName } from '../models/Site.js';
+import { exactCaseInsensitive } from '../utils/escapeRegex.js';
 import TradeGrade, { GRADE_NAMES_MAP } from '../models/TradeGrade.js';
 import { parseGrade, normaliseReviewText, sanitisePhotoUrls, canEditGrade } from '../utils/gradeValidation.js';
 import { deliverMail, deliverMailWarning } from '../utils/safeMail.js';
 import { issueOrderReceipts } from '../utils/receipts.js';
 
+// A 400 the central errorHandler passes through with this exact message.
+const badRequest = (message) => Object.assign(new Error(message), { statusCode: 400 });
+
 // Normalises incoming tradesNeeded — accepts string array OR {name,assigned} object array
 function normalizeTrades(raw) {
-  const arr = Array.isArray(raw) ? raw : JSON.parse(raw);
+  let arr = raw;
+  if (!Array.isArray(arr)) {
+    try {
+      arr = JSON.parse(raw);
+    } catch {
+      throw badRequest('tradesNeeded must be a JSON array');
+    }
+    if (!Array.isArray(arr)) throw badRequest('tradesNeeded must be a JSON array');
+  }
+
+  // One slot per trade (case-insensitive) — see findDuplicateTradeName in
+  // models/Site.js. Checked here too so the contractor gets a precise message
+  // rather than the schema validator's generic one.
+  const dup = findDuplicateTradeName(arr.map((t) => (typeof t === 'string' ? { name: t } : t)));
+  if (dup) throw badRequest(`"${dup}" is listed more than once — each trade can only appear once per project`);
+
   return arr.map((t) =>
     typeof t === 'string'
       ? {
@@ -38,6 +57,8 @@ import Receipt from '../models/Receipt.js';
 import { uploadPhoto } from '../utils/cloudinary.js';
 import { geocodeAddress } from '../utils/geocode.js';
 import { getWorkersCommitted } from '../utils/workerSlots.js';
+import { trySyncRateExplanations, tryDeleteRateExplanationsForSite } from '../utils/rateExplanations.js';
+import { RATE_EXPLANATION_TYPE } from '../models/Message.js';
 import jwt from 'jsonwebtoken';
 import stripe from '../utils/stripe.js';
 import { contractorApprovalPendingEmail, tradePayoutBlockedEmail } from '../email_templates/approvalNotice.js';
@@ -115,6 +136,9 @@ export async function createSite(req, res, next) {
 
     // Maintain bidirectional reference on contractor
     await Contractor.findByIdAndUpdate(req.userId, { $push: { sites: site._id } });
+    // Non-fatal: the project exists now. Failing here used to return 500 for a
+    // site that WAS created, so a retry produced a duplicate project.
+    await trySyncRateExplanations(site);
 
     res.status(201).json({ site });
   } catch (err) {
@@ -202,10 +226,45 @@ export async function updateSite(req, res, next) {
       { new: true, runValidators: true }
     );
     if (!site) return res.status(404).json({ message: 'Site not found' });
+    if (tradesNeeded !== undefined) await trySyncRateExplanations(site);
     res.json({ site });
   } catch (err) {
     next(err);
   }
+}
+
+// PUT /api/contractor/sites/:id/rate-comment  { tradeName, text }
+// Add / edit the contractor's rate explanation for one trade slot. Empty text deletes it.
+// Allowed at any time — the slot does not have to be open.
+export async function updateRateComment(req, res, next) {
+  try {
+    const tradeName = String(req.body.tradeName ?? '').trim();
+    const text      = String(req.body.text ?? '').trim();
+    if (!tradeName)         return res.status(400).json({ message: 'tradeName is required' });
+    if (text.length > 1000) return res.status(400).json({ message: 'Comment is too long (max 1000 characters)' });
+
+    // Case-insensitive, like every other trade-name lookup in the app (bookings,
+    // worker counts). Trade names are unique per site ignoring case, so this
+    // can match at most one slot. Escaped so the name is matched literally.
+    const site = await Site.findOneAndUpdate(
+      { _id: req.params.id, contractor: req.userId, 'tradesNeeded.name': exactCaseInsensitive(tradeName) },
+      { $set: { 'tradesNeeded.$.rateComment': text } },
+      { new: true, runValidators: true }
+    );
+    if (!site) return res.status(404).json({ message: 'Trade not found on this project' });
+
+    // Non-fatal: the comment is saved on the site (the source of truth).
+    await trySyncRateExplanations(site);
+    res.json({ site });
+  } catch (err) {
+    next(err);
+  }
+}
+
+// DELETE /api/contractor/sites/:id/rate-comment?tradeName=Painter
+export async function deleteRateComment(req, res, next) {
+  req.body = { tradeName: req.query.tradeName, text: '' };
+  return updateRateComment(req, res, next);
 }
 
 // DELETE /api/contractor/sites/:id
@@ -216,6 +275,7 @@ export async function deleteSite(req, res, next) {
 
     // Remove the reference from contractor.sites
     await Contractor.findByIdAndUpdate(req.userId, { $pull: { sites: site._id } });
+    await tryDeleteRateExplanationsForSite(site._id);
 
     res.json({ message: 'Site deleted' });
   } catch (err) {
@@ -1362,16 +1422,9 @@ export async function findTrades(req, res, next) {
       });
     }
 
-    // ── HARD FILTER: exclude trades already booked on the requiredDate ────────
-    // booking_date is a flat String on each booking subdocument — $nin traversal is reliable.
-    if (requiredDate) {
-      pipeline.push({
-        $match: {
-          'bookings.booking_date': { $nin: [requiredDate] },
-          busyDays:                { $nin: [requiredDate] },
-        },
-      });
-    }
+    // No hard filter on the project's requiredDate: pros busy or booked that day
+    // are still listed (sorted after available ones) so the contractor can pick
+    // another date in the calendar.
 
     // Sort: available on requiredDate (or today) first, then by hourlyRate
     const sortDateKey = requiredDate || todayKey;
@@ -1471,7 +1524,8 @@ export async function getSiteMessages(req, res, next) {
       .lean();
     if (!site) return res.status(404).json({ message: 'Project not found' });
 
-    const messages = await Message.find({ site: siteId })
+    // Rate explanations are project settings, not conversation — keep them out
+    const messages = await Message.find({ site: siteId, type: { $ne: RATE_EXPLANATION_TYPE } })
       .populate('tradePro', 'fullName professionality photo hourlyRate')
       .sort({ createdAt: -1 })
       .lean();

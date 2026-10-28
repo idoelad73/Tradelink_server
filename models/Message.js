@@ -14,10 +14,17 @@ const { Schema } = mongoose;
  * payment      | trade       | pending            | Trade submitted hours (no WorkHoursOrder yet)
  * payment      | contractor  | approved           | Contractor approved → WorkHoursOrder created
  * payment      | contractor  | rejected           | Contractor rejected → snapshot in text field
+ * total_hours_explanations | contractor | approved | Contractor's rate/hours explanation for one
+ *              |             |                    | trade slot (site + tradeName); text = the comment.
+ *              |             |                    | Mirrors Site.tradesNeeded[].rateComment — see
+ *              |             |                    | utils/rateExplanations.js. No tradePro.
  */
+export const RATE_EXPLANATION_TYPE = 'total_hours_explanations';
+
 const messageSchema = new Schema(
   {
-    tradePro:      { type: Schema.Types.ObjectId, ref: 'TradePro',   required: true, index: true },
+    // Required except on contractor rate explanations, which belong to a trade slot, not a pro
+    tradePro:      { type: Schema.Types.ObjectId, ref: 'TradePro',   required: function () { return this.type !== RATE_EXPLANATION_TYPE; }, index: true },
     site:          { type: Schema.Types.ObjectId, ref: 'Site',       default: null },
     contractor:    { type: Schema.Types.ObjectId, ref: 'Contractor', required: true },
     requestedDate: { type: String, default: '' },   // YYYY-MM-DD
@@ -41,7 +48,7 @@ const messageSchema = new Schema(
     },
     type: {
       type:     String,
-      enum:     ['application', 'availability', 'approval', 'reschedule', 'worker_offer', 'payment'],
+      enum:     ['application', 'availability', 'approval', 'reschedule', 'worker_offer', 'payment', RATE_EXPLANATION_TYPE],
       required: true,
     },
     senderType: {
@@ -59,6 +66,12 @@ messageSchema.index({ tradePro: 1, contractor: 1, createdAt: 1 });
 messageSchema.index(
   { tradePro: 1, site: 1, type: 1 },
   { unique: true, partialFilterExpression: { type: 'application' } }
+);
+
+// Unique: one rate explanation per site + trade slot
+messageSchema.index(
+  { site: 1, tradeName: 1, type: 1 },
+  { unique: true, partialFilterExpression: { type: RATE_EXPLANATION_TYPE } }
 );
 
 const Message = mongoose.model('Message', messageSchema);
