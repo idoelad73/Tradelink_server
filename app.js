@@ -28,6 +28,7 @@ app.post(
 // check ended in `|| 'https://…/'`, a truthy string constant that made the whole
 // condition always-true and allowed EVERY origin with credentials (finding #1).
 const ALLOWED_ORIGINS = [
+  'https://tradelink.direct',                   // production custom domain (www redirects here)
   'https://trade-link-client-dev.onrender.com',
   'https://tradelink-dashbpard.onrender.com', // deployed dashboard host (spelling matches the real deploy)
   process.env.CLIENT_URL,
