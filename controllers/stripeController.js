@@ -120,16 +120,32 @@ export async function createDepositIntent(req, res, next) {
 export async function handleWebhook(req, res) {
   const sig = req.headers['stripe-signature'];
 
+  // Two Stripe endpoints can point here, each with its own signing secret:
+  //   STRIPE_WEBHOOK_SECRET          — "Your account" events (payment_intent.*, charge.*)
+  //   STRIPE_CONNECT_WEBHOOK_SECRET  — "Connected accounts" events (account.updated)
+  // The event is accepted if it verifies against either one.
+  const configured = [process.env.STRIPE_WEBHOOK_SECRET, process.env.STRIPE_CONNECT_WEBHOOK_SECRET].filter(Boolean);
+  // None set → still verify once (Stripe then rejects it), same as before this change
+  const secrets = configured.length ? configured : [undefined];
+
   let event;
-  try {
-    event = stripe.webhooks.constructEvent(
-      req.body,                              // raw Buffer
-      sig,
-      process.env.STRIPE_WEBHOOK_SECRET
-    );
-  } catch (err) {
-    console.error('[Stripe webhook] signature verification failed:', err.message);
-    return res.status(400).send(`Webhook Error: ${err.message}`);
+  let lastErr;
+  for (const secret of secrets) {
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.body,                              // raw Buffer
+        sig,
+        secret
+      );
+      break;
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  if (!event) {
+    const message = lastErr?.message ?? 'Webhook signature verification failed';
+    console.error('[Stripe webhook] signature verification failed:', message);
+    return res.status(400).send(`Webhook Error: ${message}`);
   }
 
   const pi      = event.data.object;
